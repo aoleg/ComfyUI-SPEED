@@ -9,7 +9,6 @@ import math
 from typing import List, Sequence, Tuple
 
 import numpy as np
-import pywt
 from scipy.fft import dctn, idctn
 
 
@@ -144,6 +143,13 @@ def _dwt_expand_np(x_np: np.ndarray, t: float, seed: int) -> np.ndarray:
     Returns:
     - The expanded array at twice the source resolution (float32).
     """
+    try:
+        import pywt
+    except ImportError as e:
+        raise ImportError(
+            "transform=dwt requires the PyWavelets package; install it with "
+            "`pip install PyWavelets`, or use transform=dct / transform=fft."
+        ) from e
     H_src, W_src = x_np.shape[-2], x_np.shape[-1]
     H_tgt, W_tgt = H_src * 2, W_src * 2
     rng = np.random.default_rng(seed)

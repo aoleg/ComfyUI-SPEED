@@ -140,6 +140,14 @@ class TestDCTExpandNp(unittest.TestCase):
         self.assertGreater(low_band_energy / total_energy, 0.8)
 
 
+try:
+    import pywt  # noqa: F401
+    _HAS_PYWT = True
+except ImportError:
+    _HAS_PYWT = False
+
+
+@unittest.skipUnless(_HAS_PYWT, "PyWavelets not installed (optional, dwt transform only)")
 class TestDWTExpandNp(unittest.TestCase):
     def test_output_shape(self):
         x = np.random.randn(1, 4, 8, 8).astype(np.float32)

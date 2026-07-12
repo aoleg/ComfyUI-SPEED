@@ -1,6 +1,6 @@
 # ComfyUI-SPEED
 
-ComfyUI custom node for **SPEED** — Spectral Progressive Diffusion for faster sampling. Progressively expands the latent resolution during denoising, reducing computation while preserving visual quality.
+ComfyUI custom node, **Forge Neo (sd-webui-forge-classic) extension**, and **SwarmUI extension** for **SPEED** — Spectral Progressive Diffusion for faster sampling. Progressively expands the latent resolution during denoising, reducing computation while preserving visual quality.
 
 **Official code:** https://github.com/howardhx/speed
 
@@ -20,10 +20,44 @@ Workflow:
 | ------------------------------------------------------------------------- | ------------------------ |
 | `mode=delta_optimal` `model_preset=flux` `scales=0.5,1.0` `delta=0.01` `transform=dct` `base_sampler=euler`<br><br>![SPEED](images/anima_speed.png)<br><br>**20s**<br>**1.33x faster** | ![Original](images/anima_original.png)<br><br>**26.5s**<br>**1.00x** |
 
-## Usage
+## Usage (ComfyUI)
 
 1. Place this folder under your ComfyUI `custom_nodes` directory, then restart ComfyUI.
 2. Connect the **Sampler SPEED (Spectral Progressive Diffusion)** output to **SamplerCustomAdvanced**.
+
+## Usage (Forge Neo / sd-webui-forge-classic)
+
+The same repo doubles as a webui extension — the shared math lives in `speed_core.py`, the webui integration in `scripts/speed_forge.py`.
+
+1. Place (or `git clone`) this folder under the webui `extensions/` directory and restart the webui.
+2. Open the **SPEED (Spectral Progressive Diffusion)** accordion under the generation parameters and enable it.
+3. Generate. The sampler selected in the main **Sampling method** dropdown is used as the base solver; SPEED segments its sigma schedule and expands the latent at each transition.
+
+Notes for the webui version:
+
+- Designed for **flow-matching models** (Flux, Wan, …) whose sigmas are in `(0, 1]`. eps-prediction models (SD1.x/SDXL) run but are unvalidated; in `manual` mode thresholds above 1.0 are accepted for such schedules.
+- **Inpainting** is automatically skipped (masks and inpaint image conditioning are tied to the full latent resolution).
+- The **hires-fix pass** is untouched unless "Apply to hires-fix pass" is checked.
+- Brownian-noise samplers (DPM++ SDE family) work, but their pre-built noise sampler is only used on the full-resolution segment; coarse segments fall back to the sampler's default noise.
+- The `dwt` transform needs the optional `PyWavelets` package (`pip install PyWavelets` into the webui venv); `dct` (default) and `fft` have no extra dependencies.
+- If a transition threshold is never reached (too few steps / too small `delta`), the console warns and the output stays at the coarse resolution — increase steps or `delta`.
+- Settings are recorded in the image infotext under the `SPEED:` key.
+
+## Usage (SwarmUI)
+
+The same repo also works as a SwarmUI extension — the C# integration lives in `SPEEDSamplerExtension.cs`, and SwarmUI's portable ComfyUI backend runs the `SamplerSPEED` node from this repo.
+
+1. `git clone` this repo into SwarmUI's `src/Extensions/` directory (e.g. `src/Extensions/ComfyUI-SPEED/`), then run SwarmUI's `update` script (or launch with `launch-dev`) so the extension compiles.
+2. In the Generate tab, enable **Display Advanced Options**, find the **SPEED** parameter group, and toggle it on. If the ComfyUI-SPEED node pack isn't installed on the backend yet, click the **Install SPEED** button inside the group (this clones this same repo into the backend's `custom_nodes` and restarts it).
+3. Generate. The main **Sampler** parameter is used as the base solver.
+
+Notes for the SwarmUI version:
+
+- When SPEED is enabled, the main sampling node is rebuilt as a `SamplerCustomAdvanced` + `SamplerSPEED` graph. Swarm-specific sampler features — **Variation Seed** and tiled sampling — do not apply while SPEED is on, and live previews may behave differently.
+- Swarm-custom schedulers (`align_your_steps`, `flux2`, `ltxv`, `ideogram4`, ...) can't be rebuilt from stock Comfy nodes; SPEED falls back to `simple` for those (with a log warning). `turbo`, `karras`, and all standard Comfy schedulers are reproduced faithfully.
+- **Masked generations** (inpainting / regional masks) are automatically skipped, and the **Refiner stage** is untouched.
+- The base **Sampler** must be a k-diffusion sampler (Euler, DPM++ 2M, etc.). Exotic non-k-diffusion samplers (`ddim`, `uni_pc`, `res_multistep`) are rejected by the node with a clear error — pick another sampler.
+- The SPEED parameters are recorded in the image metadata like all Swarm params.
 
 ## Inputs
 
