@@ -26,6 +26,14 @@ public class SPEEDSamplerExtension : Extension
     /// <summary>Scheduler names that comfy's stock BasicScheduler node accepts (Swarm-custom schedulers like 'align_your_steps' or 'flux2' are computed inside SwarmKSampler and can't be rebuilt from stock nodes).</summary>
     public static HashSet<string> BasicSchedulers = ["normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform", "beta", "linear_quadratic", "kl_optimal"];
 
+    public override void PopulateMetadata()
+    {
+        base.PopulateMetadata();
+        Description = "Runs early denoising steps at a reduced latent resolution and spectrally expands to full resolution for faster sampling of flow-matching models.";
+        Tags = ["parameters", "nodes"];
+        License = "MIT";
+    }
+
     public override void OnInit()
     {
         InstallableFeatures.RegisterInstallableFeature(new("SPEED Sampler", FeatureId, "https://github.com/ruwwww/ComfyUI-SPEED", "ruwwww", "This will install the ComfyUI-SPEED node pack by ruwwww (MIT License, derived from the official SPEED code by Howard Xiao et al, BSD-3-Clause).\nDo you wish to install?"));
