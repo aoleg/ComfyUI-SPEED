@@ -40,7 +40,7 @@ public class SPEEDSamplerExtension : Extension
         ScriptFiles.Add("assets/speed_install.js");
         ComfyUIBackendExtension.NodeToFeatureMap["SamplerSPEED"] = FeatureId;
         SpeedGroup = new("SPEED", Toggles: true, Open: false, IsAdvanced: true,
-            Description: "SPEED (Spectral Progressive Diffusion): runs early denoising steps at a reduced latent resolution, then spectrally expands to full resolution, reducing computation while preserving visual quality.\nDesigned for flow-matching models (Flux, Wan). The main 'Sampler' parameter is used as the base solver.\nNot applied when a mask is in use, and not applied to the Refiner stage.");
+            Description: "SPEED (Spectral Progressive Diffusion): runs early denoising steps at a reduced latent resolution, then spectrally expands to full resolution, reducing computation while preserving visual quality.\nDesigned for flow-matching models (Flux, Wan, Krea 2, Z-Image). The main 'Sampler' parameter is used as the base solver.\nNot applied when a mask is in use, and not applied to the Refiner stage.");
         Transform = T2IParamTypes.Register<string>(new("[SPEED] Transform", "[SPEED]\nSpectral basis used at each resolution transition.\nDCT (default) supports any scale ratio. DWT requires consecutive scales to differ by exactly 2x, and needs the optional 'PyWavelets' pip package on the backend. FFT accepts any ratio.",
             "dct", Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 1,
             GetValues: (_) => ["dct///DCT (any ratio)", "dwt///DWT (2x only, needs PyWavelets)", "fft///FFT (any ratio)"]
@@ -49,9 +49,9 @@ public class SPEEDSamplerExtension : Extension
             "delta_optimal", Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 2,
             GetValues: (_) => ["delta_optimal///Delta-Optimal (automatic)", "manual///Manual sigma thresholds"]
             ));
-        ModelPreset = T2IParamTypes.Register<string>(new("[SPEED] Model Preset", "[SPEED]\nPower-spectrum preset for delta-optimal mode.\n'flux' and 'wan21' use measured (A, beta) fits. 'custom' uses the '[SPEED] Spectrum A' / '[SPEED] Spectrum Beta' inputs.",
+        ModelPreset = T2IParamTypes.Register<string>(new("[SPEED] Model Preset", "[SPEED]\nPower-spectrum preset for delta-optimal mode.\n'flux' and 'wan21' use the measured (A, beta) fits.\n'krea-2' targets few-step Krea 2 - the Turbo checkpoint at ~8 steps, or the base model with the Turbo LoRA at ~20 steps.\n'krea-2-raw' targets the undistilled Krea 2 base model at 40-50 steps with CFG, and transitions later for more speedup.\n'z-image' targets Z-Image Turbo.\n'custom' uses the '[SPEED] Spectrum A' / '[SPEED] Spectrum Beta' inputs.",
             "flux", Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 3,
-            GetValues: (_) => ["flux", "wan21", "custom"]
+            GetValues: (_) => ["flux///Flux", "wan21///Wan 2.1", "krea-2///Krea 2 (Turbo / Turbo LoRA)", "krea-2-raw///Krea 2 (raw base, CFG)", "z-image///Z-Image Turbo", "custom///Custom (A / beta below)"]
             ));
         Scales = T2IParamTypes.Register<string>(new("[SPEED] Scales", "[SPEED]\nComma-separated resolution fractions ending at 1.0.\nFor example '0.5,1.0' runs early steps at half resolution, or '0.25,0.5,1.0' adds a quarter-resolution stage.",
             "0.5,1.0", Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 4,

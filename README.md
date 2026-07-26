@@ -35,7 +35,7 @@ The same repo doubles as a webui extension — the shared math lives in `speed_c
 
 Notes for the webui version:
 
-- Designed for **flow-matching models** (Flux, Wan, …) whose sigmas are in `(0, 1]`. eps-prediction models (SD1.x/SDXL) run but are unvalidated; in `manual` mode thresholds above 1.0 are accepted for such schedules.
+- Designed for **flow-matching models** (Flux, Wan, Krea 2, Z-Image, …) whose sigmas are in `(0, 1]`. eps-prediction models (SD1.x/SDXL) run but are unvalidated and currently produce soft results — `docs/sdxl-analysis.md` explains why. In `manual` mode thresholds above 1.0 are accepted for such schedules.
 - **Inpainting** is automatically skipped (masks and inpaint image conditioning are tied to the full latent resolution).
 - The **hires-fix pass** is untouched unless "Apply to hires-fix pass" is checked.
 - Brownian-noise samplers (DPM++ SDE family) work, but their pre-built noise sampler is only used on the full-resolution segment; coarse segments fall back to the sampler's default noise.
@@ -66,7 +66,7 @@ Notes for the SwarmUI version:
 | `base_sampler` | combo | `euler` | Underlying ODE solver. Any `comfy.k_diffusion.sampling` sampler supported. |
 | `transform` | combo | `dct` | Spectral basis for expansion: `dct` (any ratio), `dwt` (2× only), `fft` (any ratio). |
 | `mode` | combo | `delta_optimal` | `delta_optimal` computes transitions from the power-spectrum preset. `manual` uses user-specified sigma thresholds. |
-| `model_preset` | combo | `flux` | Power-spectrum preset: `flux`, `wan21`, or `custom` (use `spectrum_A` / `spectrum_beta`). |
+| `model_preset` | combo | `flux` | Power-spectrum preset: `flux`, `wan21`, `krea-2`, `krea-2-raw`, `z-image`, or `custom` (use `spectrum_A` / `spectrum_beta`). See [Model presets](#model-presets). |
 | `scales` | string | `0.5,1.0` | Comma-separated resolution fractions ending at `1.0`. e.g. `0.25,0.5,1.0`. |
 | `delta` | float | `0.01` | Noise-dominated tolerance (Eq. 9). Smaller values delay transitions. |
 | `manual_sigmas` | string | `0.85` | Comma-separated sigma thresholds (one per transition). Used in `manual` mode. |
@@ -76,7 +76,31 @@ Notes for the SwarmUI version:
 
 ### delta_optimal mode (recommended)
 
-Set `model_preset` to `flux` or `wan21` and adjust `scales` and `delta`. Transition timing is computed automatically from the VAE power spectrum using Eq. 9 and Eq. 10 of the paper.
+Pick the `model_preset` that matches your checkpoint and adjust `scales` and `delta`. Transition timing is computed automatically from the latent power spectrum using Eq. 9 and Eq. 10 of the paper.
+
+### Model presets
+
+The preset supplies the power spectrum `P(w) = A * w^-beta`; SPEED evaluates it at the coarse grid's Nyquist frequency and converts it into the sigma at which the latent is expanded. The last column is that sigma for the reference case — 1024x1024, `scales=0.5,1.0`, `delta=0.01`.
+
+| Preset | Latent space | Intended for | sigma* |
+|---|---|---|---|
+| `flux` | Flux VAE | Flux (measured fit, from the official repo) | 0.8527 |
+| `wan21` | Wan 2.1 VAE | Wan 2.1 video (measured fit, from the official repo) | 0.6941 |
+| `krea-2` | Wan 2.1 / Qwen-Image | Few-step Krea 2: the Turbo checkpoint at ~8 steps, or the base model + Turbo LoRA at ~20 steps | 0.9000 |
+| `krea-2-raw` | Wan 2.1 / Qwen-Image | Undistilled Krea 2 base model, 40-50 steps with CFG — transitions later, more speedup | 0.8300 |
+| `z-image` | Flux VAE | Z-Image Turbo, 8-9 steps | 0.9400 |
+| `custom` | — | Your own `spectrum_A` / `spectrum_beta` | — |
+
+`flux` and `wan21` are the fits published with the paper. The other three are **calibrated, not measured**: `beta` is taken from the measured fit for the same VAE latent space (Krea 2 encodes with the Qwen-Image VAE, whose latent format is the Wan 2.1 one; Z-Image uses the Flux VAE), and `A` is solved so that the default `delta` places the transition where the model's step budget wants it. The derivation is in the comment block above `_PRESETS` in `speed_core.py`, and `tests/test_math.py` asserts each sigma\* above.
+
+Two things drive the calibration:
+
+- **Few-step models need full-resolution steps more than they need the speedup.** At 8 steps a transition at sigma 0.90 leaves 5 steps at full resolution; the `wan21` threshold of 0.69 leaves 3, and the result goes soft.
+- **The schedule shift moves where a sigma lands.** Krea 2 runs `mu=1.15`, i.e. an effective shift of `exp(1.15) = 3.158` (some ComfyUI workflows raise it to 1.5 -> 4.48), and Z-Image Turbo runs a shift of 3.0 (ComfyUI) to 9.0 (Forge Neo preset). Both hold sigma near 1.0 for the first third of the run, so a threshold that reads as "early" actually lands mid-schedule.
+
+`delta` stays the speed/quality slider on top of the preset — smaller transitions earlier (better quality, less speedup). For `krea-2` it spans sigma\* 0.93 at `delta=0.005` to 0.80 at `delta=0.05`.
+
+Presets are for **flow-matching** models. On eps-prediction checkpoints (SD1.x / SDXL) the delta-optimal threshold is compared against a sigma scale that runs to ~14.6 rather than 1.0, so every preset transitions far later than its own criterion intends; see `docs/sdxl-analysis.md`.
 
 ### manual mode
 

@@ -19,6 +19,24 @@ _spec = _iu.spec_from_file_location("spectral_utils", str(_ROOT / "spectral_util
 _spectral = _iu.module_from_spec(_spec)
 _spec.loader.exec_module(_spectral)
 
+
+def _load_speed_core():
+    """Load ``speed_core`` (which uses relative imports) under a synthetic package."""
+    import types
+    pkg_name = "_speed_test_pkg"
+    pkg = types.ModuleType(pkg_name)
+    pkg.__path__ = [str(_ROOT)]
+    sys.modules[pkg_name] = pkg
+    sys.modules[f"{pkg_name}.spectral_utils"] = _spectral
+    spec = _iu.spec_from_file_location(f"{pkg_name}.speed_core", str(_ROOT / "speed_core.py"))
+    module = _iu.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_speed_core = _load_speed_core()
+
 power_spectrum = _spectral.power_spectrum
 activation_time = _spectral.activation_time
 delta_optimal_transitions = _spectral.delta_optimal_transitions
@@ -80,6 +98,54 @@ class TestDeltaOptimalTransitions(unittest.TestCase):
         t_stars = delta_optimal_transitions(scales, delta=0.01, A=203.6, beta=1.92,
                                             H=64, W=64)
         self.assertEqual(t_stars, [])
+
+
+class TestPresets(unittest.TestCase):
+    """Each preset's documented transition sigma must survive edits to (A, beta).
+
+    The reference case is the one the presets are calibrated on: 1024x1024
+    (128x128 latent, so omega_max = 64), ``scales=0.5,1.0`` and ``delta=0.01``.
+    """
+
+    REFERENCE_SIGMA = {
+        "flux": 0.8527,
+        "wan21": 0.6941,
+        "krea-2": 0.9000,
+        "krea-2-raw": 0.8300,
+        "z-image": 0.9400,
+    }
+
+    def _sigma_star(self, preset, scale=0.5, delta=0.01, latent=128):
+        return delta_optimal_transitions(
+            [scale, 1.0], delta, preset["A"], preset["beta"], latent, latent)[0]
+
+    def test_documented_transition_sigmas(self):
+        for name, expected in self.REFERENCE_SIGMA.items():
+            with self.subTest(preset=name):
+                self.assertAlmostEqual(
+                    self._sigma_star(_speed_core._PRESETS[name]), expected, places=4)
+
+    def test_custom_preset_is_a_sentinel(self):
+        self.assertIsNone(_speed_core._PRESETS["custom"])
+
+    def test_krea_and_zimage_keep_their_vae_family_slope(self):
+        # beta comes from the measured fit for the same latent space; only the
+        # amplitude is calibrated. See the preset table in speed_core.py.
+        self.assertEqual(_speed_core._PRESETS["krea-2"]["beta"],
+                         _speed_core._PRESETS["wan21"]["beta"])
+        self.assertEqual(_speed_core._PRESETS["krea-2-raw"]["beta"],
+                         _speed_core._PRESETS["wan21"]["beta"])
+        self.assertEqual(_speed_core._PRESETS["z-image"]["beta"],
+                         _speed_core._PRESETS["flux"]["beta"])
+
+    def test_raw_preset_transitions_later_than_the_few_step_one(self):
+        self.assertLess(self._sigma_star(_speed_core._PRESETS["krea-2-raw"]),
+                        self._sigma_star(_speed_core._PRESETS["krea-2"]))
+
+    def test_delta_spans_a_usable_range(self):
+        krea = _speed_core._PRESETS["krea-2"]
+        self.assertAlmostEqual(self._sigma_star(krea, delta=0.005), 0.9273, places=4)
+        self.assertAlmostEqual(self._sigma_star(krea, delta=0.05), 0.7989, places=4)
 
 
 class TestKappaAndAlign(unittest.TestCase):

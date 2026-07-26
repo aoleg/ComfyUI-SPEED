@@ -97,8 +97,12 @@ class SamplerSPEED(io.ComfyNode):
                 io.Combo.Input(
                     "model_preset", options=list(_PRESETS.keys()), default="flux",
                     tooltip="Power-spectrum preset for delta-optimal mode. `flux` and "
-                            "`wan21` use measured (A, beta). `custom` uses "
-                            "the manual A / beta inputs below.",
+                            "`wan21` use the measured (A, beta) fits. `krea-2` targets "
+                            "few-step Krea 2 (the Turbo checkpoint at ~8 steps, or the "
+                            "base model with the Turbo LoRA at ~20 steps); `krea-2-raw` "
+                            "targets the undistilled base model at 40-50 steps with CFG "
+                            "and transitions later for more speedup; `z-image` targets "
+                            "Z-Image Turbo. `custom` uses the manual A / beta inputs below.",
                 ),
                 io.String.Input(
                     "scales", default="0.5,1.0",

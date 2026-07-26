@@ -173,7 +173,7 @@ class SpeedForgeScript(scripts.Script):
                 "Runs early denoising steps at a reduced latent resolution, then "
                 "spectrally expands to full resolution. The sampler selected above "
                 "is used as the base solver. Designed for flow-matching models "
-                "(Flux, Wan). Not applied to inpainting."
+                "(Flux, Wan, Krea 2, Z-Image). Not applied to inpainting."
             )
             with gr.Row():
                 transform = gr.Radio(
@@ -185,9 +185,15 @@ class SpeedForgeScript(scripts.Script):
                     info="delta_optimal: from power-spectrum preset; manual: explicit sigma thresholds.",
                 )
                 model_preset = gr.Dropdown(
-                    choices=["flux", "wan21", "custom"], value="flux", label="Spectrum preset",
-                    info="Power-spectrum fit used by delta_optimal mode.",
+                    choices=list(speed_core._PRESETS.keys()), value="flux",
+                    label="Spectrum preset",
+                    info="Power-spectrum fit used by delta_optimal mode. krea-2 = few-step "
+                         "Krea 2 (Turbo, or base + Turbo LoRA); krea-2-raw = base model at "
+                         "40-50 steps with CFG; z-image = Z-Image Turbo.",
                 )
+                # The preset list is defined by this extension, so keep a stale
+                # ui-config.json entry from restoring a value we no longer offer.
+                model_preset.do_not_save_to_config = True
             with gr.Row():
                 scales = gr.Textbox(
                     value="0.5,1.0", label="Scales",

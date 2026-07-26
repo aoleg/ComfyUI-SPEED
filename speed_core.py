@@ -30,11 +30,58 @@ from .spectral_utils import (
 
 # =============================================================================
 # Per-model power-spectrum presets.
+#
+# ``A`` and ``beta`` describe the latent power spectrum ``P(w) = A * w**-beta``;
+# ``delta_optimal`` mode turns ``P`` at the coarse grid's Nyquist frequency into
+# the transition time via Eq. 9. ``flux`` and ``wan21`` are the fits shipped by
+# the official repo.
+#
+# The remaining presets are *calibrated*, not measured: ``beta`` is taken from
+# the measured fit for the same VAE latent space, and ``A`` is then solved so
+# that the default ``delta=0.01`` with ``scales=0.5,1.0`` at 1024x1024 places
+# the transition at a target sigma chosen from the model's step budget. Each
+# entry below records that target; ``tests/test_math.py`` re-derives it.
+#
+#   preset       latent space          sigma* @1024, delta=0.01, scales=0.5,1.0
+#   flux         Flux VAE (measured)   0.8527
+#   wan21        Wan 2.1 VAE (meas.)   0.6941
+#   krea-2       Wan 2.1 / Qwen-Image  0.9000
+#   krea-2-raw   Wan 2.1 / Qwen-Image  0.8300
+#   z-image      Flux VAE              0.9400
+#
+# Why the Krea-2 presets are not just ``wan21``: Krea 2 encodes with the
+# Qwen-Image VAE, whose latent format (16ch, 8x, same per-channel mean/std) is
+# the Wan 2.1 one, so ``beta`` carries over — but the ``wan21`` amplitude was
+# fitted on low-resolution video latents and puts the transition at sigma 0.69,
+# which on Krea 2's schedule spends 5 of 8 Turbo steps at half resolution. A
+# 1024px still holds far more high-frequency latent energy than a 480p video
+# frame, so a larger ``A`` (earlier activation) is the physically expected
+# direction as well as the empirically better one.
+#
+# Krea 2 also runs a strongly shifted schedule (mu=1.15, i.e. an effective
+# shift of exp(1.15)=3.158 at every resolution; some ComfyUI workflows raise it
+# to 1.5 -> 4.48), which holds sigma near 1.0 for the first third of the run.
+# A threshold that reads as "early" therefore lands mid-schedule: at 8 steps,
+# sigma* 0.90 leaves 5 of 8 steps at full resolution, and 0.8527 (the ``flux``
+# preset) leaves 4-5 depending on the scheduler.
+#
+# Z-Image shares the Flux VAE latent space, so ``beta`` is Flux's; only the
+# amplitude is re-calibrated, because Z-Image Turbo runs 8-9 steps on a much
+# stronger shift (3.0 in ComfyUI, 9.0 in the Forge Neo preset) and the ``flux``
+# threshold leaves as few as 2 full-resolution steps at shift 9. sigma* 0.94
+# keeps at least 5 of 9 steps at full resolution across that whole shift range.
+#
+# ``delta`` remains the speed/quality slider on top of a preset. For ``krea-2``
+# it spans sigma* 0.93 (delta=0.005) to 0.80 (delta=0.05); smaller delta means
+# an earlier transition, higher quality and less speedup.
 # =============================================================================
 
 _PRESETS = {
-    "flux":   {"A": 203.615097, "beta": 1.915461},
-    "wan21":  {"A": 219.484718, "beta": 2.422687},
+    "flux":       {"A": 203.615097, "beta": 1.915461},
+    "wan21":      {"A": 219.484718, "beta": 2.422687},
+    "krea-2":     {"A": 2357.960557, "beta": 2.422687},
+    "krea-2-raw": {"A": 887.402358, "beta": 2.422687},
+    "z-image":    {"A": 877.001476, "beta": 1.915461},
     "custom": None,
 }
 
