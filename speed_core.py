@@ -281,34 +281,32 @@ def _resolve_transitions(
     pass. Adaptive removes the resolution term so the coarse/detail split stays
     where the preset was calibrated, with no per-resolution retuning.
 
-    Two guarantees, both one-directional -- adaptive never spends *more* of the
-    schedule at low resolution than the non-adaptive path would:
+    The reference split is enforced two ways, and it is worth being precise
+    about which one does the work, because it is not the obvious one:
 
-    1. ``t* = max(t*_reference, t*_actual)``. Below the reference resolution the
-       actual threshold is already the earlier (higher-sigma, more conservative)
-       one, so adaptive is a no-op there rather than making small canvases more
-       aggressive -- at 512x512 a 0.5 first scale is a 256px coarse pass, which
-       is marginal for these models already.
-    2. The coarse share is capped at the share the *reference case* produces.
-       Threshold pinning alone only neutralises the resolution term; if the
-       *schedule* is also resolution-dependent (ComfyUI's ``ModelSamplingFlux``
-       / SwarmUI's Sigma Shift derive mu from width*height, reaching mu 3.23 at
-       2048x2048 against 1.15 at 1024x1024) it compresses sigma toward 1.0 and
-       pushes the crossing later regardless of the threshold. Unguarded that
-       degenerates -- measured 34/40 coarse steps at 2048, and at 3072 the
+    1. ``t* = max(t*_reference, t*_actual)`` pins the *threshold*. This is what
+       removes the resolution term. On its own it also decides where the
+       transition lands -- but only while the schedule resembles the reference
+       one. Below the reference resolution the actual threshold is already the
+       earlier (higher-sigma, more conservative) one and is kept, so adaptive is
+       a no-op there rather than making small canvases more aggressive: at
+       512x512 a 0.5 first scale is a 256px coarse pass, marginal already.
+    2. ``ceil(n * reference_coarse_fraction(t*, ref_shift))`` pins the *share*.
+       A sigma threshold cannot express "the same split" once the schedule
+       itself moves, and it moves a lot: ComfyUI's ``ModelSamplingFlux`` and
+       SwarmUI's Sigma Shift derive mu from width*height, and FLUX.2-class
+       schedules hold sigma above 0.93 for 30 of 40 steps. Measured on one such
+       run at 1536x1536, the threshold crossing sits at step 30 while the
+       reference share is 15 -- so on these schedules (2) is what determines the
+       result and (1) reaches it indirectly, by tightening the share from 20/40
+       to 15/40. Unheld, the same run gives 33/40 coarse, and at 3072x3072 the
        transition never fires at all and the output stays half-resolution.
 
-       A sigma threshold cannot express "the same split" once the schedule
-       itself moves, so the cap is computed as a step *fraction*:
-       ``reference_coarse_fraction(t*_reference, ref_shift)`` inverts the
-       reference schedule to ask what share of steps would sit above the
-       threshold there. For ``flux`` at delta 0.01 that is 35.3%, i.e. 15 of 40
-       steps -- so a 1536x1536 render with Sigma Shift on lands on 15/40 too
-       rather than the flat half-and-half a fixed cap would give. Presets
-       without a ``ref_shift`` (``custom``, where the model is unknown) fall
-       back to ``MAX_COARSE_FRACTION``, and that flat bound also stays on as a
-       backstop for pathological ``delta`` values whose reference split is
-       itself degenerate.
+    So (2) is the calculation, not a clamp on it: it is derived from the preset
+    and ``delta`` and tracks both (flux2 at 40 steps: 9 coarse steps at
+    delta 0.0025, 15 at 0.01, 23 at 0.05). ``MAX_COARSE_FRACTION`` is the only
+    arbitrary number here and applies only to ``custom``, which declares no
+    ``ref_shift`` because its model -- and so its schedule -- is unknown.
     """
     if len(scales) < 2:
         return []
@@ -339,29 +337,32 @@ def _resolve_transitions(
             n_steps,
         )
         if adaptive:
-            # Flat backstop, shared across the ladder: with one transition it is
-            # MAX_COARSE_FRACTION of the schedule, with two the first lands by
-            # half of that, and so on.
-            cap = int(n_steps * MAX_COARSE_FRACTION * (i + 1) / n_transitions)
-            basis = "backstop"
             if ref_shift:
-                # Preferred: the share the reference case itself would spend
-                # coarse, so a shifted schedule reproduces the reference split
-                # rather than merely being bounded away from the worst case.
-                ref_cap = math.ceil(n_steps * reference_coarse_fraction(t_thr, ref_shift))
-                if ref_cap < cap:
-                    cap, basis = ref_cap, "reference split"
-            if step_idx > cap:
+                # The reference split itself: what share of the schedule the
+                # reference case spends coarse at this threshold. Derived from
+                # the preset and delta, so it moves with both -- this is the
+                # answer, not a bound on one.
+                limit = math.ceil(n_steps * reference_coarse_fraction(t_thr, ref_shift))
+                basis = "reference split"
+            else:
+                # Only for `custom`, where the model's schedule is unknown and
+                # there is nothing to derive a share from. Shared across the
+                # ladder: one transition gets MAX_COARSE_FRACTION, two split it.
+                limit = int(n_steps * MAX_COARSE_FRACTION * (i + 1) / n_transitions)
+                basis = "flat backstop, no ref_shift for this preset"
+            if step_idx > limit:
                 if log_fn is not None:
                     where = ("never reached in this schedule" if step_idx >= n_steps
                              else f"step {step_idx}")
                     log_fn(
-                        f"adaptive delta: {s_old:g}->{s_new:g} transition would land at "
-                        f"{where}; capped to step {cap} of {n_steps} ({basis}). A "
-                        "resolution-dependent schedule shift (ComfyUI ModelSamplingFlux "
-                        "/ SwarmUI Sigma Shift) is the usual cause."
+                        f"adaptive delta: holding the {s_old:g}->{s_new:g} transition at "
+                        f"step {limit} of {n_steps} ({basis}); this schedule's own "
+                        f"crossing is at {where}. The gap means the schedule is more "
+                        "compressed than the reference one -- a resolution-dependent "
+                        "shift (ComfyUI ModelSamplingFlux / SwarmUI Sigma Shift) is the "
+                        "usual cause."
                     )
-                step_idx = cap
+                step_idx = limit
         if step_idx >= n_steps:
             break
         out.append((step_idx, s_old, s_new))

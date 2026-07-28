@@ -142,9 +142,9 @@ Eq. 10 is not wrong here — a larger canvas really does keep its high-frequency
 It is deliberately one-directional — it only ever moves the transition *earlier* than the unadapted path, never later — which gives two useful guarantees:
 
 - **A no-op at or below 1024x1024.** Below the reference the unadapted threshold is already the more conservative one and is kept, so small canvases don't silently become more aggressive (at 512x512 a `0.5` first scale is a 256px coarse pass, marginal for these models already).
-- **A cap on the coarse share, derived from the reference split.** Threshold pinning alone only neutralises the resolution term. If the *schedule* is also resolution-dependent — ComfyUI's `ModelSamplingFlux` and SwarmUI's **Sigma Shift** derive mu from `width*height`, reaching mu 3.23 at 2048x2048 against 1.15 at 1024x1024 — it compresses sigma toward 1.0 and pushes the crossing later whatever the threshold says. Unguarded that degenerates badly: 37 of 40 steps coarse at 2048x2048, and at 3072x3072 the transition never fires at all and the output stays half-resolution.
+- **The reference *share* of steps**, which on strongly shifted schedules is what actually determines the result. Threshold pinning alone only neutralises the resolution term. If the *schedule* is also resolution-dependent — ComfyUI's `ModelSamplingFlux` and SwarmUI's **Sigma Shift** derive mu from `width*height` — it compresses sigma toward 1.0 and pushes the crossing later whatever the threshold says. A FLUX.2-class schedule at 1536x1536 holds sigma above 0.93 for **30 of 40 steps**; unheld, that run gives 33/40 coarse, and at 3072x3072 the transition never fires at all and the output stays half-resolution.
 
-  A sigma threshold simply cannot express "the same split" once the schedule itself moves, so the cap is a step **fraction** instead. Each preset declares `ref_shift`, the model's own effective schedule multiplier at 1024x1024, and inverting that schedule gives the share of steps that would sit above the threshold there — 35.3% for `flux` at `delta=0.01`, i.e. 15 of 40 steps. So a 1536x1536 render with Sigma Shift on lands on **15/40 too**, matching the reference rather than settling for a flat half-and-half:
+  A sigma threshold simply cannot express "the same split" once the schedule itself moves, so the second constraint is a step **fraction**. Each preset declares `ref_shift`, the model's own effective schedule multiplier at 1024x1024, and inverting that schedule gives the share of steps that would sit above the threshold there — 35.3% for `flux` at `delta=0.01`, i.e. 15 of 40 steps:
 
   | With Sigma Shift on | adaptive off | adaptive on |
   |---|---|---|
@@ -153,7 +153,7 @@ It is deliberately one-directional — it only ever moves the transition *earlie
   | 2048×2048 | 37 / 3 | **15 / 25** |
   | 3072×3072 | 40 / 0 (never transitions) | **15 / 25** |
 
-  `custom` declares no `ref_shift` — the model, and so its schedule, is unknown — and falls back to a flat 50% bound, which also stays on as a backstop for pathological `delta` values whose reference split is itself degenerate.
+  This is a calculation, not a clamp on one: it is derived from the preset and `delta` and moves with both — `flux2` at 40 steps gives 9 coarse steps at `delta=0.0025`, 15 at `0.01`, 23 at `0.05`. On these schedules it is the share that decides the outcome and the threshold pin that reaches it indirectly, by tightening the share (20/40 → 15/40 in the 1536x1536 case above). `MAX_COARSE_FRACTION` (50%) is the one arbitrary number involved and applies **only** to `custom`, which declares no `ref_shift` because its model — and so its schedule — is unknown.
 
 Turn it off to reproduce pre-adaptive behaviour exactly. `delta` keeps its meaning either way — with adaptive on it is the value **at the 1024x1024 reference**, i.e. exactly the delta the preset table above is documented against, applied at any resolution. The console reports what it did:
 

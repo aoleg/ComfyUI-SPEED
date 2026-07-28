@@ -301,6 +301,28 @@ class TestAdaptiveDelta(unittest.TestCase):
                 self.assertEqual(flat, steps * _speed_core.MAX_COARSE_FRACTION)
                 self.assertLess(derived, flat)
 
+    def test_derived_share_wins_over_the_flat_backstop(self):
+        # The flat fraction is arbitrary; the derived share is not. When a
+        # preset declares ref_shift the derived value must be used even where
+        # it is the more permissive of the two, otherwise a large delta silently
+        # stops meaning what it says.
+        steps, delta = 40, 0.05
+        sigmas = self._schedule(steps, mu=6.70)
+        transitions = _speed_core._resolve_transitions(
+            sigmas, [0.5, 1.0], delta, self.A, self.BETA, 192, 192,
+            adaptive=True, ref_latent=128, ref_shift=self.REF_SHIFT)
+        t_ref = delta_optimal_transitions([0.5, 1.0], delta, self.A, self.BETA, 128, 128)[0]
+        expected = math.ceil(steps * _spectral.reference_coarse_fraction(t_ref, self.REF_SHIFT))
+        self.assertEqual(transitions[-1][0], expected)
+        self.assertGreater(expected, steps * _speed_core.MAX_COARSE_FRACTION)
+
+    def test_flat_backstop_still_applies_without_a_ref_shift(self):
+        # `custom` has no model to derive a share from, so the arbitrary bound
+        # is all that is left and must stay active.
+        steps = 40
+        coarse = self._coarse_steps(384, steps, mu=6.70, adaptive=True, ref_shift=None)
+        self.assertEqual(coarse, int(steps * _speed_core.MAX_COARSE_FRACTION))
+
     def test_reference_cap_does_not_bind_at_the_reference(self):
         # Deriving the cap must not disturb the case it is derived from.
         for latent in (64, 96, 128):
