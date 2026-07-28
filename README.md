@@ -48,8 +48,16 @@ Notes for the webui version:
 The same repo also works as a SwarmUI extension — the C# integration lives in `SPEEDSamplerExtension.cs`, and SwarmUI's portable ComfyUI backend runs the `SamplerSPEED` node from this repo.
 
 1. `git clone` this repo into SwarmUI's `src/Extensions/` directory (e.g. `src/Extensions/ComfyUI-SPEED/`), then run SwarmUI's `update` script (or launch with `launch-dev`) so the extension compiles.
-2. In the Generate tab, enable **Display Advanced Options**, find the **SPEED** parameter group, and toggle it on. If the ComfyUI-SPEED node pack isn't installed on the backend yet, click the **Install SPEED** button inside the group (this clones this same repo into the backend's `custom_nodes` and restarts it).
+2. In the Generate tab, enable **Display Advanced Options**, find the **SPEED** parameter group, and toggle it on. If the ComfyUI-SPEED node pack isn't installed on the backend yet, click the **Install SPEED** button inside the group (this clones this same repo into the backend's `DLNodes` and restarts it).
 3. Generate. The main **Sampler** parameter is used as the base solver.
+
+> **The extension and the node pack must come from the same repo.** They are two separate installs: the C# extension in `src/Extensions/ComfyUI-SPEED`, and the Python node pack in the backend's `.../ComfyUIBackend/DLNodes/ComfyUI-SPEED`. Rebuilding SwarmUI updates only the first. If they diverge, ComfyUI builds the node's arguments from its own `INPUT_TYPES` and **silently drops** anything the installed node doesn't declare — so newer parameters appear in the UI, change nothing, and report no error. The extension now warns in the SwarmUI log when it detects this, but to check or fix it directly:
+>
+> ```bash
+> git -C <SwarmUI>/src/BuiltinExtensions/ComfyUIBackend/DLNodes/ComfyUI-SPEED remote -v
+> ```
+>
+> If that is not this repo, re-point it (`git remote set-url origin <this repo>` then `git pull`) or delete the folder and use **Install SPEED** again. SwarmUI skips cloning when the folder already exists and `git pull`s it on every startup, so a wrong remote is sticky and keeps re-asserting itself.
 
 Notes for the SwarmUI version:
 

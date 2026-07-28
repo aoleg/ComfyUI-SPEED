@@ -15,6 +15,24 @@ public class SPEEDSamplerExtension : Extension
 {
     public const string FeatureId = "speed";
 
+    /// <summary>Repo the backend node pack is installed from. This must be the same repo this extension ships in: SwarmUI sends node inputs by name and ComfyUI silently drops any the installed node does not declare, so a node pack from a different (or older) repo turns every parameter added here into a no-op with no error anywhere. SwarmUI clones this into DLNodes/&lt;repo name&gt;, skips the clone if that folder already exists, and then git-pulls it on every startup - so pointing this at the wrong repo is sticky and self-healing in the wrong direction.</summary>
+    public const string RepoUrl = "https://github.com/aoleg/ComfyUI-SPEED";
+
+    /// <summary>Node inputs this extension sends that older node packs do not have. Used only to warn about a version mismatch.</summary>
+    public static string[] RequiredNodeInputs = ["adaptive_delta", "log"];
+
+    /// <summary>Presets offered here, as "id///Display Name". The ids must match the node's own preset table (_PRESETS in speed_core.py) - kept in one place so the mismatch check below has something to compare against.</summary>
+    public static string[] ModelPresets =
+    [
+        "flux///Flux",
+        "wan21///Wan 2.1",
+        "krea-2///Krea 2 (Turbo / Turbo LoRA)",
+        "krea-2-raw///Krea 2 (raw base, CFG)",
+        "z-image///Z-Image Turbo",
+        "flux2///FLUX.2 (dev / Klein, unverified fit)",
+        "custom///Custom (A / beta below)"
+    ];
+
     public static T2IRegisteredParam<string> Transform, Mode, ModelPreset, Scales, ManualSigmas;
 
     public static T2IRegisteredParam<double> Delta, SpectrumA, SpectrumBeta;
@@ -38,10 +56,11 @@ public class SPEEDSamplerExtension : Extension
 
     public override void OnInit()
     {
-        InstallableFeatures.RegisterInstallableFeature(new("SPEED Sampler", FeatureId, "https://github.com/ruwwww/ComfyUI-SPEED", "ruwwww", "This will install the ComfyUI-SPEED node pack by ruwwww (MIT License, derived from the official SPEED code by Howard Xiao et al, BSD-3-Clause).\nDo you wish to install?"));
+        InstallableFeatures.RegisterInstallableFeature(new("SPEED Sampler", FeatureId, RepoUrl, "aoleg", $"This will install the ComfyUI-SPEED node pack from {RepoUrl} (MIT License, derived from ruwwww's ComfyUI-SPEED and from the official SPEED code by Howard Xiao et al, BSD-3-Clause).\nThis must be the same repo this extension came from - the model presets and adaptive-delta options it sends need the matching node version.\nDo you wish to install?"));
         ScriptFiles.Add("assets/speed_install.js");
         ScriptFiles.Add("assets/speed_ui.js");
         ComfyUIBackendExtension.NodeToFeatureMap["SamplerSPEED"] = FeatureId;
+        ComfyUIBackendExtension.RawObjectInfoParsers.Add(WarnOnNodeVersionMismatch);
         SpeedGroup = new("SPEED", Toggles: true, Open: false, IsAdvanced: true,
             Description: "SPEED (Spectral Progressive Diffusion): runs early denoising steps at a reduced latent resolution, then spectrally expands to full resolution, reducing computation while preserving visual quality.\nDesigned for flow-matching models (Flux, Wan, Krea 2, Z-Image). The main 'Sampler' parameter is used as the base solver.\nNot applied when a mask is in use, and not applied to the Refiner stage.");
         Transform = T2IParamTypes.Register<string>(new("[SPEED] Transform", "[SPEED]\nSpectral basis used at each resolution transition.\nDCT (default) supports any scale ratio. DWT requires consecutive scales to differ by exactly 2x, and needs the optional 'PyWavelets' pip package on the backend. FFT accepts any ratio.",
@@ -54,7 +73,7 @@ public class SPEEDSamplerExtension : Extension
             ));
         ModelPreset = T2IParamTypes.Register<string>(new("[SPEED] Model Preset", "[SPEED]\nPower-spectrum preset for delta-optimal mode.\n'flux' and 'wan21' use the measured (A, beta) fits.\n'krea-2' targets few-step Krea 2 - the Turbo checkpoint at ~8 steps, or the base model with the Turbo LoRA at ~20 steps.\n'krea-2-raw' targets the undistilled Krea 2 base model at 40-50 steps with CFG, and transitions later for more speedup.\n'z-image' targets Z-Image Turbo.\n'flux2' targets FLUX.2 [dev] / Klein at 40-50 steps - unlike the others this has no measured spectrum fit, treat it as a starting point to refine with 'custom'.\n'custom' uses the '[SPEED] Spectrum A' / '[SPEED] Spectrum Beta' inputs, which only show once 'custom' is selected.\nAll preset targets are calibrated at 1024x1024 - delta-optimal is resolution-aware by design, so generating larger pushes the transition later (more of the run at low resolution) for the same preset and delta. Watch the backend console's '[SPEED] transitions:' line to see where it actually landed.",
             "flux", Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 3,
-            GetValues: (_) => ["flux///Flux", "wan21///Wan 2.1", "krea-2///Krea 2 (Turbo / Turbo LoRA)", "krea-2-raw///Krea 2 (raw base, CFG)", "z-image///Z-Image Turbo", "flux2///FLUX.2 (dev / Klein, unverified fit)", "custom///Custom (A / beta below)"]
+            GetValues: (_) => [.. ModelPresets]
             ));
         Scales = T2IParamTypes.Register<string>(new("[SPEED] Scales", "[SPEED]\nComma-separated resolution fractions ending at 1.0.\nFor example '0.5,1.0' runs early steps at half resolution, or '0.25,0.5,1.0' adds a quarter-resolution stage.",
             "0.5,1.0", Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 4,
@@ -87,6 +106,48 @@ public class SPEEDSamplerExtension : Extension
         // Runs just after the main sampler step (-5), before the refiner (-4): rewrites the main
         // sampler node in place so all downstream connections to it remain valid.
         WorkflowGenerator.AddStep(ApplySpeed, -4.5);
+    }
+
+    /// <summary>Warns when the installed node pack is older than this extension.
+    /// ComfyUI builds a node's arguments from its own INPUT_TYPES and ignores anything else in the prompt, so sending a parameter
+    /// a stale node does not declare is silently dropped - the control appears in the UI, changes nothing, and reports no error.
+    /// That is expensive to debug from the symptom, so surface it at the one moment we can actually see the node's schema.</summary>
+    public static void WarnOnNodeVersionMismatch(JObject rawObjectInfo)
+    {
+        if (rawObjectInfo["SamplerSPEED"] is not JObject node)
+        {
+            return; // Not installed at all; the feature flag already covers that case.
+        }
+        HashSet<string> declared = [];
+        foreach (string section in new[] { "required", "optional" })
+        {
+            if (node["input"]?[section] is JObject inputs)
+            {
+                foreach (JProperty prop in inputs.Properties())
+                {
+                    declared.Add(prop.Name);
+                }
+            }
+        }
+        string[] missingInputs = [.. RequiredNodeInputs.Where(i => !declared.Contains(i))];
+        if (missingInputs.Any())
+        {
+            Logs.Warning($"[SPEED] The installed ComfyUI-SPEED node pack is older than this extension: it does not accept {string.Join(", ", missingInputs)}. "
+                + "ComfyUI ignores inputs a node does not declare, so those options will do nothing (with no error). "
+                + $"Update the node pack - its git remote must be {RepoUrl}.");
+        }
+        // The preset list lives in the node, so a stale pack also rejects any preset added since. That one fails loudly at
+        // generation time rather than silently, but naming it here is far more actionable than 'value not in list'.
+        if (ComfyUIBackendExtension.TryGetRequiredInputs(rawObjectInfo, "SamplerSPEED", "model_preset", out JToken presets))
+        {
+            HashSet<string> available = [.. presets.Select(p => $"{p}")];
+            string[] missingPresets = [.. ModelPresets.Select(v => v.Before("///")).Where(v => !available.Contains(v))];
+            if (missingPresets.Any())
+            {
+                Logs.Warning($"[SPEED] The installed node pack does not offer these presets: {string.Join(", ", missingPresets)}. "
+                    + "Selecting one will fail the generation. Update the node pack.");
+            }
+        }
     }
 
     public static void ApplySpeed(WorkflowGenerator g)
