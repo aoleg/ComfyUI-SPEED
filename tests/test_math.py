@@ -114,7 +114,19 @@ class TestPresets(unittest.TestCase):
         "krea-2": 0.9000,
         "krea-2-raw": 0.8300,
         "z-image": 0.9400,
-        "flux2": 0.9000,
+        "flux2": 0.9325,
+    }
+
+    # Share of the schedule spent coarse at the reference. This is the number
+    # that is comparable across presets -- sigma* is not, because the share it
+    # buys also depends on the model's shift.
+    REFERENCE_COARSE_SHARE = {
+        "flux": 0.3531,
+        "wan21": 0.7790,
+        "krea-2": 0.2598,
+        "krea-2-raw": 0.3928,
+        "z-image": 0.1607,
+        "flux2": 0.3531,
     }
 
     def _sigma_star(self, preset, scale=0.5, delta=0.01, latent=None):
@@ -166,11 +178,35 @@ class TestPresets(unittest.TestCase):
     def test_flux2_sigma_star_holds_at_its_own_geometry(self):
         # Guards the recalibration: assuming the 8x geometry (a 128 latent at
         # 1024px) puts the same A at a much higher Nyquist frequency, where the
-        # spectrum is weaker and the transition lands far later than the 0.90
-        # target -- which is exactly the bug this preset shipped with first.
+        # spectrum is weaker and the transition lands far later than the target
+        # -- which is exactly the bug this preset shipped with first.
         preset = _speed_core._PRESETS["flux2"]
-        self.assertAlmostEqual(self._sigma_star(preset, latent=64), 0.9000, places=4)
-        self.assertLess(self._sigma_star(preset, latent=128), 0.85)
+        self.assertAlmostEqual(self._sigma_star(preset, latent=64), 0.9325, places=4)
+        self.assertLess(self._sigma_star(preset, latent=128), 0.90)
+
+    def test_documented_reference_coarse_shares(self):
+        # The comparable quantity across presets. Pinning it catches a preset
+        # whose sigma looks conservative but whose schedule share is not.
+        for name, expected in self.REFERENCE_COARSE_SHARE.items():
+            with self.subTest(preset=name):
+                preset = _speed_core._PRESETS[name]
+                share = _spectral.reference_coarse_fraction(
+                    self._sigma_star(preset), preset["ref_shift"])
+                self.assertAlmostEqual(share, expected, places=4)
+
+    def test_flux2_shares_flux_step_budget_despite_a_stronger_shift(self):
+        # flux2's shift is 2.4x flux's, so matching sigma would *not* match the
+        # step split -- the two must agree on the share, not on the threshold.
+        def share(name):
+            preset = _speed_core._PRESETS[name]
+            return _spectral.reference_coarse_fraction(
+                self._sigma_star(preset), preset["ref_shift"])
+        self.assertAlmostEqual(share("flux2"), share("flux"), places=4)
+        self.assertGreater(_speed_core._PRESETS["flux2"]["ref_shift"],
+                           2 * _speed_core._PRESETS["flux"]["ref_shift"])
+        self.assertNotAlmostEqual(self._sigma_star(_speed_core._PRESETS["flux2"]),
+                                  self._sigma_star(_speed_core._PRESETS["flux"]),
+                                  places=2)
 
     def test_flux2_beta_is_borrowed_not_matched(self):
         # Unlike krea-2/z-image (an exact VAE match), flux2's beta is only the

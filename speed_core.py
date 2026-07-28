@@ -45,13 +45,23 @@ from .spectral_utils import (
 # the transition at a target sigma chosen from the model's step budget. Each
 # entry below records that target; ``tests/test_math.py`` re-derives it.
 #
-#   preset       latent space          sigma* @1024, delta=0.01, scales=0.5,1.0
-#   flux         Flux VAE (measured)   0.8527   (ref latent 128)
-#   wan21        Wan 2.1 VAE (meas.)   0.6941   (ref latent 128)
-#   krea-2       Wan 2.1 / Qwen-Image  0.9000   (ref latent 128)
-#   krea-2-raw   Wan 2.1 / Qwen-Image  0.8300   (ref latent 128)
-#   z-image      Flux VAE              0.9400   (ref latent 128)
-#   flux2        Flux VAE (borrowed)   0.9000   (ref latent  64, see below)
+#   preset       latent space          sigma* @1024   coarse share of schedule
+#   flux         Flux VAE (measured)   0.8527         35.3%   (ref latent 128)
+#   wan21        Wan 2.1 VAE (meas.)   0.6941         77.9%   (ref latent 128)
+#   krea-2       Wan 2.1 / Qwen-Image  0.9000         26.0%   (ref latent 128)
+#   krea-2-raw   Wan 2.1 / Qwen-Image  0.8300         39.3%   (ref latent 128)
+#   z-image      Flux VAE              0.9400         16.1%   (ref latent 128)
+#   flux2        Flux VAE (borrowed)   0.9325         35.3%   (ref latent  64, see below)
+#
+# Read the *share* column, not the sigma column, when comparing presets. sigma*
+# is not comparable across models: the share of the schedule it buys depends on
+# the model's shift too, and those differ by more than 2x here. flux2 first
+# shipped at sigma* 0.9000, chosen because it looked like the most conservative
+# number in the table -- against FLUX.2's 7.54 shift that was a 45.6% coarse
+# share, the most aggressive setting here rather than the least. It is now
+# pinned to flux's 35.3% share instead, which is what the sigma was meant to
+# express. (wan21's 77.9% is the upstream measured fit, left as published: it
+# targets video at its own step counts, not 40-50 step stills.)
 #
 # Why the Krea-2 presets are not just ``wan21``: Krea 2 encodes with the
 # Qwen-Image VAE, whose latent format (16ch, 8x, same per-channel mean/std) is
@@ -132,7 +142,7 @@ _PRESETS = {
     "krea-2":     {"A": 2357.960557, "beta": 2.422687, "ref_latent": 128, "ref_shift": 3.158193},
     "krea-2-raw": {"A": 887.402358, "beta": 2.422687, "ref_latent": 128, "ref_shift": 3.158193},
     "z-image":    {"A": 877.001476, "beta": 1.915461, "ref_latent": 128, "ref_shift": 3.0},
-    "flux2":      {"A": 107.764103, "beta": 1.915461, "ref_latent": 64, "ref_shift": 7.538325},
+    "flux2":      {"A": 196.90775, "beta": 1.915461, "ref_latent": 64, "ref_shift": 7.538325},
     "custom": None,
 }
 

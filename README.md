@@ -92,17 +92,19 @@ Pick the `model_preset` that matches your checkpoint and adjust `scales` and `de
 
 The preset supplies the power spectrum `P(w) = A * w^-beta`; SPEED evaluates it at the coarse grid's Nyquist frequency and converts it into the sigma at which the latent is expanded. The last column is that sigma for the reference case — 1024x1024, `scales=0.5,1.0`, `delta=0.01`.
 
-| Preset | Latent space | Intended for | sigma* |
-|---|---|---|---|
-| `flux` | Flux VAE | Flux (measured fit, from the official repo) | 0.8527 |
-| `wan21` | Wan 2.1 VAE | Wan 2.1 video (measured fit, from the official repo) | 0.6941 |
-| `krea-2` | Wan 2.1 / Qwen-Image | Few-step Krea 2: the Turbo checkpoint at ~8 steps, or the base model + Turbo LoRA at ~20 steps | 0.9000 |
-| `krea-2-raw` | Wan 2.1 / Qwen-Image | Undistilled Krea 2 base model, 40-50 steps with CFG — transitions later, more speedup | 0.8300 |
-| `z-image` | Flux VAE | Z-Image Turbo, 8-9 steps | 0.9400 |
-| `flux2` | Flux VAE (**unverified**) | FLUX.2 [dev] / Klein, 40-50 steps | 0.9000 † |
-| `custom` | — | Your own `spectrum_A` / `spectrum_beta` | — |
+| Preset | Latent space | Intended for | sigma\* | coarse share |
+|---|---|---|---|---|
+| `flux` | Flux VAE | Flux (measured fit, from the official repo) | 0.8527 | 35.3% |
+| `wan21` | Wan 2.1 VAE | Wan 2.1 video (measured fit, from the official repo) | 0.6941 | 77.9% |
+| `krea-2` | Wan 2.1 / Qwen-Image | Few-step Krea 2: the Turbo checkpoint at ~8 steps, or the base model + Turbo LoRA at ~20 steps | 0.9000 | 26.0% |
+| `krea-2-raw` | Wan 2.1 / Qwen-Image | Undistilled Krea 2 base model, 40-50 steps with CFG — transitions later, more speedup | 0.8300 | 39.3% |
+| `z-image` | Flux VAE | Z-Image Turbo, 8-9 steps | 0.9400 | 16.1% |
+| `flux2` | Flux VAE (**unverified**) | FLUX.2 [dev] / Klein, 40-50 steps | 0.9325 † | 35.3% |
+| `custom` | — | Your own `spectrum_A` / `spectrum_beta` | — | — |
 
 † FLUX.2's sampler latent is 1/16 scale, so its sigma\* is quoted at a 64x64 reference grid; every other preset uses 128x128. Same 1024x1024 image either way.
+
+**Compare presets on the coarse share, not on sigma\*.** A transition sigma is not comparable across models: the share of the schedule it buys depends on the model's shift as well, and those differ by more than 2× here. `flux2` originally shipped at sigma\* 0.9000 because that read as the most conservative number in the table — against FLUX.2's 7.54 shift it was a 45.6% coarse share, making it the *most* aggressive preset rather than the least. It is now pinned to `flux`'s 35.3% share, which is what the sigma was meant to express. (`wan21`'s 77.9% is the upstream measured fit, left as published — it targets video at its own step counts, not 40–50 step stills.)
 
 `flux` and `wan21` are the fits published with the paper. `krea-2`, `krea-2-raw` and `z-image` are **calibrated, not measured**: `beta` is taken from the measured fit for the same VAE latent space (Krea 2 encodes with the Qwen-Image VAE, whose latent format is the Wan 2.1 one; Z-Image uses the Flux VAE), and `A` is solved so that the default `delta` places the transition where the model's step budget wants it. The derivation is in the comment block above `_PRESETS` in `speed_core.py`, and `tests/test_math.py` asserts each sigma\* above.
 
@@ -113,7 +115,14 @@ Two things drive the calibration:
 - **Few-step models need full-resolution steps more than they need the speedup.** At 8 steps a transition at sigma 0.90 leaves 5 steps at full resolution; the `wan21` threshold of 0.69 leaves 3, and the result goes soft.
 - **The schedule shift moves where a sigma lands.** Krea 2 runs `mu=1.15`, i.e. an effective shift of `exp(1.15) = 3.158` (some ComfyUI workflows raise it to 1.5 -> 4.48), Z-Image Turbo runs a shift of 3.0 (ComfyUI) to 9.0 (Forge Neo preset), and FLUX.2 runs `mu=2.02` (effective 7.54) — all three hold sigma near 1.0 well into the run, so a threshold that reads as "early" actually lands mid-schedule or later.
 
-`delta` stays the speed/quality slider on top of the preset — smaller transitions earlier (better quality, less speedup). For `krea-2` it spans sigma\* 0.93 at `delta=0.005` to 0.80 at `delta=0.05`.
+`delta` stays the speed/quality slider on top of the preset — smaller transitions earlier (better quality, less speedup) — and it keeps working with adaptive delta on, because the cap is derived from the reference split *at your delta* rather than being a fixed number. Halving `delta` is a reasonable "more quality" step; at 40 steps it moves the coarse budget by about a fifth:
+
+| `delta` | `flux` | `flux2` | `krea-2` |
+|---|---|---|---|
+| 0.005 | 12/40 coarse | 12/40 | 8/40 |
+| **0.01** (default) | **15/40** | **15/40** | **11/40** |
+| 0.02 | 18/40 | 18/40 | 14/40 |
+| 0.05 | 23/40 | 23/40 | 18/40 |
 
 Presets are for **flow-matching** models. On eps-prediction checkpoints (SD1.x / SDXL) the delta-optimal threshold is compared against a sigma scale that runs to ~14.6 rather than 1.0, so every preset transitions far later than its own criterion intends; see `docs/sdxl-analysis.md`.
 
