@@ -38,6 +38,7 @@ public class SPEEDSamplerExtension : Extension
     {
         InstallableFeatures.RegisterInstallableFeature(new("SPEED Sampler", FeatureId, "https://github.com/ruwwww/ComfyUI-SPEED", "ruwwww", "This will install the ComfyUI-SPEED node pack by ruwwww (MIT License, derived from the official SPEED code by Howard Xiao et al, BSD-3-Clause).\nDo you wish to install?"));
         ScriptFiles.Add("assets/speed_install.js");
+        ScriptFiles.Add("assets/speed_ui.js");
         ComfyUIBackendExtension.NodeToFeatureMap["SamplerSPEED"] = FeatureId;
         SpeedGroup = new("SPEED", Toggles: true, Open: false, IsAdvanced: true,
             Description: "SPEED (Spectral Progressive Diffusion): runs early denoising steps at a reduced latent resolution, then spectrally expands to full resolution, reducing computation while preserving visual quality.\nDesigned for flow-matching models (Flux, Wan, Krea 2, Z-Image). The main 'Sampler' parameter is used as the base solver.\nNot applied when a mask is in use, and not applied to the Refiner stage.");
@@ -49,9 +50,9 @@ public class SPEEDSamplerExtension : Extension
             "delta_optimal", Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 2,
             GetValues: (_) => ["delta_optimal///Delta-Optimal (automatic)", "manual///Manual sigma thresholds"]
             ));
-        ModelPreset = T2IParamTypes.Register<string>(new("[SPEED] Model Preset", "[SPEED]\nPower-spectrum preset for delta-optimal mode.\n'flux' and 'wan21' use the measured (A, beta) fits.\n'krea-2' targets few-step Krea 2 - the Turbo checkpoint at ~8 steps, or the base model with the Turbo LoRA at ~20 steps.\n'krea-2-raw' targets the undistilled Krea 2 base model at 40-50 steps with CFG, and transitions later for more speedup.\n'z-image' targets Z-Image Turbo.\n'custom' uses the '[SPEED] Spectrum A' / '[SPEED] Spectrum Beta' inputs.",
+        ModelPreset = T2IParamTypes.Register<string>(new("[SPEED] Model Preset", "[SPEED]\nPower-spectrum preset for delta-optimal mode.\n'flux' and 'wan21' use the measured (A, beta) fits.\n'krea-2' targets few-step Krea 2 - the Turbo checkpoint at ~8 steps, or the base model with the Turbo LoRA at ~20 steps.\n'krea-2-raw' targets the undistilled Krea 2 base model at 40-50 steps with CFG, and transitions later for more speedup.\n'z-image' targets Z-Image Turbo.\n'flux2' targets FLUX.2 [dev] / Klein at 40-50 steps - unlike the others this has no measured spectrum fit, treat it as a starting point to refine with 'custom'.\n'custom' uses the '[SPEED] Spectrum A' / '[SPEED] Spectrum Beta' inputs, which only show once 'custom' is selected.\nAll preset targets are calibrated at 1024x1024 - delta-optimal is resolution-aware by design, so generating larger pushes the transition later (more of the run at low resolution) for the same preset and delta. Watch the backend console's '[SPEED] transitions:' line to see where it actually landed.",
             "flux", Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 3,
-            GetValues: (_) => ["flux///Flux", "wan21///Wan 2.1", "krea-2///Krea 2 (Turbo / Turbo LoRA)", "krea-2-raw///Krea 2 (raw base, CFG)", "z-image///Z-Image Turbo", "custom///Custom (A / beta below)"]
+            GetValues: (_) => ["flux///Flux", "wan21///Wan 2.1", "krea-2///Krea 2 (Turbo / Turbo LoRA)", "krea-2-raw///Krea 2 (raw base, CFG)", "z-image///Z-Image Turbo", "flux2///FLUX.2 (dev / Klein, unverified fit)", "custom///Custom (A / beta below)"]
             ));
         Scales = T2IParamTypes.Register<string>(new("[SPEED] Scales", "[SPEED]\nComma-separated resolution fractions ending at 1.0.\nFor example '0.5,1.0' runs early steps at half resolution, or '0.25,0.5,1.0' adds a quarter-resolution stage.",
             "0.5,1.0", Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 4,
@@ -65,11 +66,15 @@ public class SPEEDSamplerExtension : Extension
             "0.85", Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 6, DependNonDefault: Mode.Type.ID,
             Examples: ["0.85", "0.95,0.85"]
             ));
+        // No DependNonDefault here: that mechanism only supports "other param differs from
+        // its own default" (here, "!= flux"), which would show these on every non-flux
+        // preset. Visibility for these two is instead handled entirely by
+        // assets/speed_ui.js, gated on ModelPreset == "custom" specifically.
         SpectrumA = T2IParamTypes.Register<double>(new("[SPEED] Spectrum A", "[SPEED]\nPower-law amplitude 'A' of the latent power spectrum.\nOnly used when '[SPEED] Model Preset' is 'custom'.",
-            "203.615097", Min: 0, Max: 1000000, Step: 0.001, Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 7, DependNonDefault: ModelPreset.Type.ID
+            "203.615097", Min: 0, Max: 1000000, Step: 0.001, Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 7
             ));
         SpectrumBeta = T2IParamTypes.Register<double>(new("[SPEED] Spectrum Beta", "[SPEED]\nPower-law decay exponent 'beta' of the latent power spectrum.\nOnly used when '[SPEED] Model Preset' is 'custom'.",
-            "1.915461", Min: 0, Max: 10, Step: 0.001, Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 8, DependNonDefault: ModelPreset.Type.ID
+            "1.915461", Min: 0, Max: 10, Step: 0.001, Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 8
             ));
         SpectralSeed = T2IParamTypes.Register<long>(new("[SPEED] Spectral Noise Seed", "[SPEED]\nSeed for the spectral-noise padding applied at each transition.\n'-1' follows the generation seed.",
             "-1", Min: -1, Max: int.MaxValue, Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 9
@@ -119,7 +124,8 @@ public class SPEEDSamplerExtension : Extension
                 ["manual_sigmas"] = g.UserInput.Get(ManualSigmas, "0.85"),
                 ["spectrum_A"] = g.UserInput.Get(SpectrumA, 203.615097),
                 ["spectrum_beta"] = g.UserInput.Get(SpectrumBeta, 1.915461),
-                ["seed"] = spectralSeed % int.MaxValue
+                ["seed"] = spectralSeed % int.MaxValue,
+                ["log"] = true
             });
         }
         string classType = $"{samplerNode["class_type"]}";

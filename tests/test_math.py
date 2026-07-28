@@ -113,6 +113,7 @@ class TestPresets(unittest.TestCase):
         "krea-2": 0.9000,
         "krea-2-raw": 0.8300,
         "z-image": 0.9400,
+        "flux2": 0.9000,
     }
 
     def _sigma_star(self, preset, scale=0.5, delta=0.01, latent=128):
@@ -141,6 +142,13 @@ class TestPresets(unittest.TestCase):
     def test_raw_preset_transitions_later_than_the_few_step_one(self):
         self.assertLess(self._sigma_star(_speed_core._PRESETS["krea-2-raw"]),
                         self._sigma_star(_speed_core._PRESETS["krea-2"]))
+
+    def test_flux2_beta_is_borrowed_not_matched(self):
+        # Unlike krea-2/z-image (an exact VAE match), flux2's beta is only the
+        # closest available analog -- FLUX.2's VAE has no measured fit here.
+        # This just pins the documented relationship so a drift is caught.
+        self.assertEqual(_speed_core._PRESETS["flux2"]["beta"],
+                         _speed_core._PRESETS["flux"]["beta"])
 
     def test_delta_spans_a_usable_range(self):
         krea = _speed_core._PRESETS["krea-2"]

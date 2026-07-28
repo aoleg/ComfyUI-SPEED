@@ -24,6 +24,10 @@ from .speed_core import (
 )
 
 
+def _log(msg: str):
+    print(f"[SPEED] {msg}")
+
+
 @torch.no_grad()
 def sample_speed(
     model, x, sigmas, extra_args=None, callback=None, disable=None,
@@ -37,11 +41,17 @@ def sample_speed(
     spectrum_beta: float = 1.915461,
     manual_sigmas: List[float] = None,
     seed: int = 0,
+    log: bool = True,
 ):
     """Comfy-compatible ``sample_*`` function."""
     sampler_fn = getattr(kds, f"sample_{base_sampler}", None)
     if sampler_fn is None:
         raise ValueError(f"Unknown base sampler {base_sampler!r}.")
+
+    if log:
+        _log(f"pass start: x={tuple(x.shape)}, steps={len(sigmas) - 1}, "
+             f"sigmas {float(sigmas[0]):.4f}->{float(sigmas[-2]):.4f}, "
+             f"mode={mode}, transform={transform}, scales={scales}, seed={seed}")
 
     return sample_speed_core(
         sampler_fn, model, x, sigmas,
@@ -49,6 +59,7 @@ def sample_speed(
         transform=transform, mode=mode, scales=scales, delta=delta,
         spectrum_A=spectrum_A, spectrum_beta=spectrum_beta,
         manual_sigmas=manual_sigmas, seed=seed,
+        log_fn=_log if log else None,
     )
 
 
@@ -102,7 +113,12 @@ class SamplerSPEED(io.ComfyNode):
                             "base model with the Turbo LoRA at ~20 steps); `krea-2-raw` "
                             "targets the undistilled base model at 40-50 steps with CFG "
                             "and transitions later for more speedup; `z-image` targets "
-                            "Z-Image Turbo. `custom` uses the manual A / beta inputs below.",
+                            "Z-Image Turbo; `flux2` targets FLUX.2 [dev]/Klein at 40-50 "
+                            "steps, but has no measured spectrum fit -- treat it as a "
+                            "starting point. `custom` uses the manual A / beta inputs "
+                            "below. All sigma* targets are calibrated at 1024x1024; "
+                            "generating larger pushes the transition later for the same "
+                            "delta (see `log`).",
                 ),
                 io.String.Input(
                     "scales", default="0.5,1.0",
@@ -131,13 +147,22 @@ class SamplerSPEED(io.ComfyNode):
                     "seed", default=0, min=0, max=2**31 - 1, step=1,
                     tooltip="Seed for the spectral-noise padding at each transition.",
                 ),
+                io.Boolean.Input(
+                    "log", default=True,
+                    tooltip="Print the resolved transition step(s) and sigma(s) to the "
+                            "console every run, e.g. `[SPEED] transitions: step 8: "
+                            "0.5->1 (sigma=0.8473)`. Cheap (one line per generation) and "
+                            "the fastest way to tell whether a preset/delta is landing "
+                            "the transition where you expect at your actual resolution "
+                            "and step count.",
+                ),
             ],
             outputs=[io.Sampler.Output()],
         )
 
     @classmethod
     def execute(cls, base_sampler, transform, mode, model_preset, scales, delta,
-                manual_sigmas, spectrum_A, spectrum_beta, seed):
+                manual_sigmas, spectrum_A, spectrum_beta, seed, log):
         preset = _PRESETS.get(model_preset)
         if preset is not None:
             A, beta = preset["A"], preset["beta"]
@@ -159,6 +184,7 @@ class SamplerSPEED(io.ComfyNode):
                 "spectrum_beta": beta,
                 "manual_sigmas": parsed_sigmas,
                 "seed": int(seed),
+                "log": bool(log),
             },
         )
         return io.NodeOutput(sampler)

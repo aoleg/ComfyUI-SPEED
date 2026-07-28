@@ -189,7 +189,8 @@ class SpeedForgeScript(scripts.Script):
                     label="Spectrum preset",
                     info="Power-spectrum fit used by delta_optimal mode. krea-2 = few-step "
                          "Krea 2 (Turbo, or base + Turbo LoRA); krea-2-raw = base model at "
-                         "40-50 steps with CFG; z-image = Z-Image Turbo.",
+                         "40-50 steps with CFG; z-image = Z-Image Turbo; flux2 = FLUX.2 at "
+                         "40-50 steps (no measured spectrum fit -- a starting point).",
                 )
                 # The preset list is defined by this extension, so keep a stale
                 # ui-config.json entry from restoring a value we no longer offer.

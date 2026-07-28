@@ -48,6 +48,7 @@ from .spectral_utils import (
 #   krea-2       Wan 2.1 / Qwen-Image  0.9000
 #   krea-2-raw   Wan 2.1 / Qwen-Image  0.8300
 #   z-image      Flux VAE              0.9400
+#   flux2        Flux VAE (borrowed)   0.9000
 #
 # Why the Krea-2 presets are not just ``wan21``: Krea 2 encodes with the
 # Qwen-Image VAE, whose latent format (16ch, 8x, same per-channel mean/std) is
@@ -71,9 +72,39 @@ from .spectral_utils import (
 # threshold leaves as few as 2 full-resolution steps at shift 9. sigma* 0.94
 # keeps at least 5 of 9 steps at full resolution across that whole shift range.
 #
+# ``flux2`` is the weakest-founded entry here and is flagged as such: there is
+# no measured (A, beta) fit for FLUX.2's VAE anywhere this repo has access to,
+# and unlike Krea 2 it is not a byte-identical match to an existing fit --
+# FLUX.2's latent is 32 real channels at 16x spatial compression (packed into
+# a 128-channel/8x tensor; see ``latent_rgb_factors_reshape`` in ComfyUI's
+# ``latent_formats.py``), not the 16ch/8x of Flux.1's. ``beta`` is Flux.1's,
+# on no stronger basis than "closest available analog, same lineage" -- take
+# it as a starting point to refine with ``custom``, not a calibrated value.
+# What *is* source-backed: FLUX.2 Klein 4B/9B both declare ``shift = 2.02``
+# (ComfyUI ``supported_models.py``, log-space mu like Flux.1/Krea 2, i.e. an
+# effective multiplier of exp(2.02) = 7.54 -- much stronger than Flux.1's
+# default 1.15). No separate entry exists for the 32B "dev" checkpoint at
+# this writing; Klein's value is assumed to carry over since all FLUX.2
+# variants share the same VAE. That shift crowds sigma near 1.0 hard: at 40-50
+# steps even sigma* 0.90 -- deliberately the least aggressive target in this
+# table -- lands the transition close to the schedule's midpoint.
+#
 # ``delta`` remains the speed/quality slider on top of a preset. For ``krea-2``
 # it spans sigma* 0.93 (delta=0.005) to 0.80 (delta=0.05); smaller delta means
 # an earlier transition, higher quality and less speedup.
+#
+# All of the sigma* figures above are for a 1024x1024 generation. delta_optimal
+# is resolution-aware by design (Eq. 9/10 evaluate the VAE spectrum at the
+# coarse grid's actual Nyquist frequency, in latent pixels) -- generating
+# larger pushes the transition later, i.e. more of the run at low resolution,
+# for the same preset and delta. At 2048x2048 the ``flux`` preset's own
+# threshold (unchanged) moves from sigma* 0.8527 to 0.7324, which on a 40-step
+# Beta schedule is the difference between transitioning at step 15 (37.5% low
+# res) and step 22 (55% low res). This is not a bug -- it is delta_optimal
+# doing what Eq. 10 says -- but it means a delta tuned to look right at 1024
+# will read as over-aggressive at 2048+; lower delta to compensate at large
+# canvases, or watch the per-run "transitions:" log line this preset table is
+# calibrated against.
 # =============================================================================
 
 _PRESETS = {
@@ -82,6 +113,7 @@ _PRESETS = {
     "krea-2":     {"A": 2357.960557, "beta": 2.422687},
     "krea-2-raw": {"A": 887.402358, "beta": 2.422687},
     "z-image":    {"A": 877.001476, "beta": 1.915461},
+    "flux2":      {"A": 406.523198, "beta": 1.915461},
     "custom": None,
 }
 
