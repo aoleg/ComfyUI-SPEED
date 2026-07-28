@@ -134,9 +134,9 @@ def make_p(sampler_func, is_hr_pass=False, mask=None, is_inpaint=False):
 
 
 UI_DEFAULTS = dict(transform="dct", mode="manual", model_preset="flux",
-                   scales="0.5,1.0", delta=0.01, manual_sigmas="0.72",
-                   spectrum_A=203.615097, spectrum_beta=1.915461,
-                   seed=-1, apply_hr=False)
+                   scales="0.5,1.0", adaptive_delta=True, delta=0.01,
+                   manual_sigmas="0.72", spectrum_A=203.615097,
+                   spectrum_beta=1.915461, seed=-1, apply_hr=False)
 
 
 def run_hooks(p, enabled=True, seeds=(123,), **overrides):
@@ -145,8 +145,8 @@ def run_hooks(p, enabled=True, seeds=(123,), **overrides):
     script = speed_forge.SpeedForgeScript()
     script.before_process_batch(
         p, enabled, ui["transform"], ui["mode"], ui["model_preset"],
-        ui["scales"], ui["delta"], ui["manual_sigmas"], ui["spectrum_A"],
-        ui["spectrum_beta"], ui["seed"], ui["apply_hr"],
+        ui["scales"], ui["adaptive_delta"], ui["delta"], ui["manual_sigmas"],
+        ui["spectrum_A"], ui["spectrum_beta"], ui["seed"], ui["apply_hr"],
         seeds=list(seeds), prompts=["test"], subseeds=[0])
     script.process_before_every_sampling(p)
     return script

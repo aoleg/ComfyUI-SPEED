@@ -5,6 +5,7 @@ Run from the repo root with:
   python -m unittest tests.test_math -v
 """
 import importlib.util as _iu
+import math
 import pathlib
 import sys
 import unittest
@@ -116,7 +117,9 @@ class TestPresets(unittest.TestCase):
         "flux2": 0.9000,
     }
 
-    def _sigma_star(self, preset, scale=0.5, delta=0.01, latent=128):
+    def _sigma_star(self, preset, scale=0.5, delta=0.01, latent=None):
+        # Default to the preset's own reference geometry -- flux2's differs.
+        latent = preset["ref_latent"] if latent is None else latent
         return delta_optimal_transitions(
             [scale, 1.0], delta, preset["A"], preset["beta"], latent, latent)[0]
 
@@ -143,6 +146,32 @@ class TestPresets(unittest.TestCase):
         self.assertLess(self._sigma_star(_speed_core._PRESETS["krea-2-raw"]),
                         self._sigma_star(_speed_core._PRESETS["krea-2"]))
 
+    def test_every_preset_declares_its_reference_latent(self):
+        for name, preset in _speed_core._PRESETS.items():
+            if preset is None:
+                continue
+            with self.subTest(preset=name):
+                self.assertIn("ref_latent", preset)
+
+    def test_flux2_reference_latent_is_half(self):
+        # FLUX.2 encodes at 8x into 32 channels then packs 2x2 spatially into
+        # the channel axis, so its sampler-visible latent is 1/16 scale: a
+        # 1024px image is 64x64, not 128x128. Its sigma* is therefore
+        # calibrated at omega_max 32, not 64.
+        self.assertEqual(_speed_core._PRESETS["flux2"]["ref_latent"], 64)
+        for name in ("flux", "wan21", "krea-2", "krea-2-raw", "z-image"):
+            with self.subTest(preset=name):
+                self.assertEqual(_speed_core._PRESETS[name]["ref_latent"], 128)
+
+    def test_flux2_sigma_star_holds_at_its_own_geometry(self):
+        # Guards the recalibration: assuming the 8x geometry (a 128 latent at
+        # 1024px) puts the same A at a much higher Nyquist frequency, where the
+        # spectrum is weaker and the transition lands far later than the 0.90
+        # target -- which is exactly the bug this preset shipped with first.
+        preset = _speed_core._PRESETS["flux2"]
+        self.assertAlmostEqual(self._sigma_star(preset, latent=64), 0.9000, places=4)
+        self.assertLess(self._sigma_star(preset, latent=128), 0.85)
+
     def test_flux2_beta_is_borrowed_not_matched(self):
         # Unlike krea-2/z-image (an exact VAE match), flux2's beta is only the
         # closest available analog -- FLUX.2's VAE has no measured fit here.
@@ -154,6 +183,92 @@ class TestPresets(unittest.TestCase):
         krea = _speed_core._PRESETS["krea-2"]
         self.assertAlmostEqual(self._sigma_star(krea, delta=0.005), 0.9273, places=4)
         self.assertAlmostEqual(self._sigma_star(krea, delta=0.05), 0.7989, places=4)
+
+
+class TestAdaptiveDelta(unittest.TestCase):
+    """``adaptive_delta`` holds the coarse/detail step split across resolutions.
+
+    Schedules here are the flow-matching ones these presets target: sigma =
+    exp(mu)*t / (exp(mu)*t + 1 - t) over a uniform t, which is what
+    ``PredictionFlux`` / ComfyUI's ``ModelSamplingFlux`` produce.
+    """
+
+    A, BETA = 203.615097, 1.915461   # flux preset
+
+    def _schedule(self, steps, mu=1.15):
+        shift = math.exp(mu)
+        ts = [1.0 - i / steps for i in range(steps)]
+        return torch.tensor([shift * t / (shift * t + 1.0 - t) for t in ts] + [0.0])
+
+    def _coarse_steps(self, latent, steps=40, mu=1.15, adaptive=False, scales=None):
+        sigmas = self._schedule(steps, mu)
+        transitions = _speed_core._resolve_transitions(
+            sigmas, scales or [0.5, 1.0], 0.01, self.A, self.BETA, latent, latent,
+            adaptive=adaptive, ref_latent=128)
+        return transitions[-1][0] if transitions else steps
+
+    def test_without_adaptive_the_coarse_share_grows_with_resolution(self):
+        # The reported problem: same preset and delta, bigger canvas, more of
+        # the schedule spent painting the coarse pass.
+        at_1024 = self._coarse_steps(128)
+        at_2048 = self._coarse_steps(256)
+        self.assertGreater(at_2048, at_1024)
+
+    def test_adaptive_pins_the_split_across_resolutions(self):
+        reference = self._coarse_steps(128, adaptive=True)
+        for latent in (192, 256, 384):    # 1536, 2048, 3072 px at 8x
+            with self.subTest(latent=latent):
+                self.assertEqual(self._coarse_steps(latent, adaptive=True), reference)
+
+    def test_adaptive_is_a_noop_at_and_below_the_reference(self):
+        # Never more aggressive than the unadapted path: below the reference the
+        # actual threshold is already the conservative one and is kept.
+        for latent in (64, 96, 128):      # 512, 768, 1024 px
+            with self.subTest(latent=latent):
+                self.assertEqual(self._coarse_steps(latent, adaptive=True),
+                                 self._coarse_steps(latent, adaptive=False))
+
+    def test_adaptive_never_transitions_later_than_unadapted(self):
+        for latent in (64, 128, 192, 256, 384):
+            with self.subTest(latent=latent):
+                self.assertLessEqual(self._coarse_steps(latent, adaptive=True),
+                                     self._coarse_steps(latent, adaptive=False))
+
+    def test_cap_rescues_a_resolution_dependent_schedule_shift(self):
+        # ComfyUI ModelSamplingFlux / SwarmUI Sigma Shift derive mu from
+        # width*height, which compresses sigma toward 1.0 and pushes the
+        # crossing later no matter what the threshold is. Unguarded at 3072px
+        # the transition never fires at all and the output stays half-size.
+        steps, mu_3072 = 40, 6.70
+        self.assertEqual(self._coarse_steps(384, steps, mu_3072, adaptive=False), steps)
+        capped = self._coarse_steps(384, steps, mu_3072, adaptive=True)
+        self.assertLessEqual(capped, steps * _speed_core.MAX_COARSE_FRACTION)
+        self.assertGreater(steps - capped, 0)
+
+    def test_cap_does_not_bind_on_a_designed_configuration(self):
+        # The safety net must be invisible in normal use.
+        for latent in (128, 192, 256):
+            with self.subTest(latent=latent):
+                coarse = self._coarse_steps(latent, adaptive=True)
+                self.assertLess(coarse, 40 * _speed_core.MAX_COARSE_FRACTION)
+
+    def test_multi_scale_ladder_stays_ordered_under_the_cap(self):
+        transitions = _speed_core._resolve_transitions(
+            self._schedule(40, mu=6.70), [0.25, 0.5, 1.0], 0.01, self.A, self.BETA,
+            384, 384, adaptive=True, ref_latent=128)
+        indices = [idx for idx, _, _ in transitions]
+        self.assertEqual(indices, sorted(indices))
+        self.assertLessEqual(indices[-1], 40 * _speed_core.MAX_COARSE_FRACTION)
+
+    def test_equivalent_delta_round_trips(self):
+        # The number reported in the adaptive log line must actually reproduce
+        # the pinned threshold at the frequency it is quoted for.
+        for omega in (16.0, 32.0, 48.0, 96.0):
+            with self.subTest(omega=omega):
+                target = 0.8527
+                d = _spectral.equivalent_delta(target, self.A, self.BETA, omega)
+                back = activation_time(power_spectrum(omega, self.A, self.BETA), d)
+                self.assertAlmostEqual(back, target, places=6)
 
 
 class TestKappaAndAlign(unittest.TestCase):
@@ -204,7 +319,11 @@ class TestDCTExpandNp(unittest.TestCase):
             _dct_expand_np(x, (8, 8), t=0.5, seed=42)
 
     def test_preserves_low_frequencies_approximately(self):
-        x = np.random.randn(1, 1, 8, 8).astype(np.float32)
+        # Seeded deliberately: on 8x8 white noise this ratio ranges roughly
+        # 0.67-0.92 (mean 0.83) across inputs, so an unseeded draw fails the
+        # 0.8 threshold about a quarter of the time. The property is real, the
+        # sample is just small -- pin the input rather than loosen the bound.
+        x = np.random.default_rng(0).standard_normal((1, 1, 8, 8)).astype(np.float32)
         out = _dct_expand_np(x, (16, 16), t=0.0, seed=42)
         # With t=0, the expanded high-freq coefficients are zero, so after
         # IDCT the energy should be concentrated in the low frequencies.

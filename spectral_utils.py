@@ -42,6 +42,29 @@ def activation_time(P_omega: float, delta: float) -> float:
     return 1.0 / (1.0 + math.sqrt(delta / (P_omega * (1.0 + P_omega - delta))))
 
 
+def equivalent_delta(t_star: float, A: float, beta: float, omega: float) -> float:
+    """Return the ``delta`` that puts ``activation_time`` at ``t_star`` for ``omega``.
+
+    The closed-form inverse of ``activation_time``: with ``u = ((1-t)/t)**2``,
+    ``delta = u*P*(1+P) / (1 + u*P)``. Used to report what an adaptive-delta run
+    is doing in terms the ``delta`` input is expressed in.
+
+    Args:
+    - t_star: Target activation time in ``(0, 1)``.
+    - A: Power-law amplitude.
+    - beta: Power-law decay exponent.
+    - omega: Radial spatial frequency the transition is evaluated at.
+
+    Returns:
+    - The equivalent ``delta``.
+    """
+    if not (0.0 < t_star < 1.0):
+        raise ValueError(f"t_star must be in (0, 1); got {t_star}")
+    P = power_spectrum(omega, A, beta)
+    u = ((1.0 - t_star) / t_star) ** 2
+    return u * P * (1.0 + P) / (1.0 + u * P)
+
+
 def delta_optimal_transitions(
     scales: Sequence[float],
     delta: float,

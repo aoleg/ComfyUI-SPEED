@@ -18,6 +18,7 @@ import comfy.k_diffusion.sampling as kds
 
 from .speed_core import (
     _PRESETS,
+    REFERENCE_LATENT,
     _parse_scales,
     _parse_sigmas,
     sample_speed_core,
@@ -41,6 +42,8 @@ def sample_speed(
     spectrum_beta: float = 1.915461,
     manual_sigmas: List[float] = None,
     seed: int = 0,
+    adaptive_delta: bool = True,
+    ref_latent: int = 128,
     log: bool = True,
 ):
     """Comfy-compatible ``sample_*`` function."""
@@ -59,6 +62,7 @@ def sample_speed(
         transform=transform, mode=mode, scales=scales, delta=delta,
         spectrum_A=spectrum_A, spectrum_beta=spectrum_beta,
         manual_sigmas=manual_sigmas, seed=seed,
+        adaptive_delta=adaptive_delta, ref_latent=ref_latent,
         log_fn=_log if log else None,
     )
 
@@ -125,9 +129,26 @@ class SamplerSPEED(io.ComfyNode):
                     tooltip="Comma-separated resolution fractions ending at 1.0. Used in "
                             "delta_optimal mode. Example: `0.5,1.0` or `0.25,0.5,1.0`.",
                 ),
+                io.Boolean.Input(
+                    "adaptive_delta", default=True,
+                    tooltip="Keep the coarse/detail step split at the split the preset "
+                            "was calibrated for (1024x1024) instead of letting it grow "
+                            "with the canvas. Eq. 10 evaluates the spectrum at the "
+                            "coarse grid's own Nyquist frequency, so without this the "
+                            "same `delta` spends progressively more of the schedule at "
+                            "low resolution as you generate larger -- for `flux` at 40 "
+                            "steps, 16/40 coarse steps at 1024x1024 but 22/40 at "
+                            "2048x2048, which starves the detail pass exactly where you "
+                            "need it. Only ever transitions earlier than the unadapted "
+                            "path, never later, so it is a no-op at or below 1024x1024. "
+                            "Applies to delta_optimal mode only.",
+                ),
                 io.Float.Input(
                     "delta", default=0.01, min=1e-4, max=0.5, step=0.001,
-                    tooltip="Noise-dominated tolerance. Smaller values transition later.",
+                    tooltip="Noise-dominated tolerance. Smaller values transition later. "
+                            "With `adaptive_delta` on this is the value at the 1024x1024 "
+                            "reference -- exactly the delta the preset table is "
+                            "documented against, applied at any resolution.",
                 ),
                 io.String.Input(
                     "manual_sigmas", default="0.85",
@@ -161,13 +182,17 @@ class SamplerSPEED(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, base_sampler, transform, mode, model_preset, scales, delta,
-                manual_sigmas, spectrum_A, spectrum_beta, seed, log):
+    def execute(cls, base_sampler, transform, mode, model_preset, scales,
+                adaptive_delta, delta, manual_sigmas, spectrum_A, spectrum_beta,
+                seed, log):
         preset = _PRESETS.get(model_preset)
         if preset is not None:
             A, beta = preset["A"], preset["beta"]
+            ref_latent = preset["ref_latent"]
         else:
             A, beta = float(spectrum_A), float(spectrum_beta)
+            # Unknown model, so unknown VAE compression: assume the 8x case.
+            ref_latent = REFERENCE_LATENT
 
         parsed_scales = _parse_scales(scales)
         parsed_sigmas = _parse_sigmas(manual_sigmas) if mode == "manual" else []
@@ -184,6 +209,8 @@ class SamplerSPEED(io.ComfyNode):
                 "spectrum_beta": beta,
                 "manual_sigmas": parsed_sigmas,
                 "seed": int(seed),
+                "adaptive_delta": bool(adaptive_delta),
+                "ref_latent": int(ref_latent),
                 "log": bool(log),
             },
         )

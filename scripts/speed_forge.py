@@ -139,6 +139,7 @@ def _make_speed_func(base_fn, cfg: dict):
                 scales=cfg["scales"], delta=cfg["delta"],
                 spectrum_A=cfg["spectrum_A"], spectrum_beta=cfg["spectrum_beta"],
                 manual_sigmas=cfg["manual_sigmas"], seed=cfg["seed"],
+                adaptive_delta=cfg["adaptive_delta"], ref_latent=cfg["ref_latent"],
                 sampler_kwargs=kwargs, full_res_sampler_kwargs=full_res_kwargs,
                 log_fn=_log,
             )
@@ -200,10 +201,19 @@ class SpeedForgeScript(scripts.Script):
                     value="0.5,1.0", label="Scales",
                     info="Comma-separated resolution fractions ending at 1.0, e.g. 0.25,0.5,1.0",
                 )
-                delta = gr.Slider(
-                    minimum=0.0001, maximum=0.5, step=0.0001, value=0.01, label="Delta",
-                    info="Noise-dominated tolerance; smaller transitions later (delta_optimal).",
-                )
+                with gr.Column():
+                    adaptive_delta = gr.Checkbox(
+                        value=True, label="Adaptive delta",
+                        info="Hold the coarse/detail step split at the preset's 1024x1024 "
+                             "calibration instead of letting the coarse pass grow with "
+                             "resolution. No-op at or below 1024x1024.",
+                    )
+                    delta = gr.Slider(
+                        minimum=0.0001, maximum=0.5, step=0.0001, value=0.01, label="Delta",
+                        info="Noise-dominated tolerance; smaller transitions later "
+                             "(delta_optimal). With Adaptive delta on, this is the value "
+                             "at the 1024x1024 reference.",
+                    )
             with gr.Row():
                 manual_sigmas = gr.Textbox(
                     value="0.85", label="Manual sigmas",
@@ -227,12 +237,13 @@ class SpeedForgeScript(scripts.Script):
                 visible=not is_img2img,
             )
 
-        return [enabled, transform, mode, model_preset, scales, delta,
-                manual_sigmas, spectrum_A, spectrum_beta, seed, apply_hr]
+        return [enabled, transform, mode, model_preset, scales, adaptive_delta,
+                delta, manual_sigmas, spectrum_A, spectrum_beta, seed, apply_hr]
 
     def before_process_batch(self, p, enabled, transform, mode, model_preset,
-                             scales, delta, manual_sigmas, spectrum_A,
-                             spectrum_beta, seed, apply_hr, *args, **kwargs):
+                             scales, adaptive_delta, delta, manual_sigmas,
+                             spectrum_A, spectrum_beta, seed, apply_hr,
+                             *args, **kwargs):
         cls = SpeedForgeScript
         cls.enabled = bool(enabled)
         cls.config = None
@@ -245,8 +256,11 @@ class SpeedForgeScript(scripts.Script):
         preset = speed_core._PRESETS.get(model_preset)
         if preset is not None:
             A, beta = preset["A"], preset["beta"]
+            ref_latent = preset["ref_latent"]
         else:
             A, beta = float(spectrum_A), float(spectrum_beta)
+            # Unknown model, so unknown VAE compression: assume the 8x case.
+            ref_latent = speed_core.REFERENCE_LATENT
 
         try:
             parsed_scales = speed_core._parse_scales(scales)
@@ -271,10 +285,13 @@ class SpeedForgeScript(scripts.Script):
             "spectrum_beta": beta,
             "manual_sigmas": parsed_sigmas,
             "seed": seed,
+            "adaptive_delta": bool(adaptive_delta),
+            "ref_latent": int(ref_latent),
         }
 
         p.extra_generation_params["SPEED"] = (
             f"{transform}/{mode}/{model_preset} scales={scales} delta={delta} "
+            + ("adaptive " if adaptive_delta and mode == "delta_optimal" else "")
             + (f"manual_sigmas={manual_sigmas} " if mode == "manual" else "")
             + f"seed={seed}"
         )

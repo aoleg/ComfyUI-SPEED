@@ -23,6 +23,7 @@ from .spectral_utils import (
     _fft_expand_np,
     align_timestep,
     delta_optimal_transitions,
+    equivalent_delta,
     kappa,
     validate_scales,
 )
@@ -43,12 +44,12 @@ from .spectral_utils import (
 # entry below records that target; ``tests/test_math.py`` re-derives it.
 #
 #   preset       latent space          sigma* @1024, delta=0.01, scales=0.5,1.0
-#   flux         Flux VAE (measured)   0.8527
-#   wan21        Wan 2.1 VAE (meas.)   0.6941
-#   krea-2       Wan 2.1 / Qwen-Image  0.9000
-#   krea-2-raw   Wan 2.1 / Qwen-Image  0.8300
-#   z-image      Flux VAE              0.9400
-#   flux2        Flux VAE (borrowed)   0.9000
+#   flux         Flux VAE (measured)   0.8527   (ref latent 128)
+#   wan21        Wan 2.1 VAE (meas.)   0.6941   (ref latent 128)
+#   krea-2       Wan 2.1 / Qwen-Image  0.9000   (ref latent 128)
+#   krea-2-raw   Wan 2.1 / Qwen-Image  0.8300   (ref latent 128)
+#   z-image      Flux VAE              0.9400   (ref latent 128)
+#   flux2        Flux VAE (borrowed)   0.9000   (ref latent  64, see below)
 #
 # Why the Krea-2 presets are not just ``wan21``: Krea 2 encodes with the
 # Qwen-Image VAE, whose latent format (16ch, 8x, same per-channel mean/std) is
@@ -93,27 +94,35 @@ from .spectral_utils import (
 # it spans sigma* 0.93 (delta=0.005) to 0.80 (delta=0.05); smaller delta means
 # an earlier transition, higher quality and less speedup.
 #
-# All of the sigma* figures above are for a 1024x1024 generation. delta_optimal
-# is resolution-aware by design (Eq. 9/10 evaluate the VAE spectrum at the
-# coarse grid's actual Nyquist frequency, in latent pixels) -- generating
-# larger pushes the transition later, i.e. more of the run at low resolution,
-# for the same preset and delta. At 2048x2048 the ``flux`` preset's own
-# threshold (unchanged) moves from sigma* 0.8527 to 0.7324, which on a 40-step
-# Beta schedule is the difference between transitioning at step 15 (37.5% low
-# res) and step 22 (55% low res). This is not a bug -- it is delta_optimal
-# doing what Eq. 10 says -- but it means a delta tuned to look right at 1024
-# will read as over-aggressive at 2048+; lower delta to compensate at large
-# canvases, or watch the per-run "transitions:" log line this preset table is
-# calibrated against.
+# ``ref_latent`` is the latent short side the preset's sigma* is calibrated at,
+# i.e. what a 1024x1024 generation looks like on that model's VAE grid. It is
+# 128 for the 8x-compression VAEs (Flux, Wan 2.1 / Qwen-Image, Z-Image) and 64
+# for FLUX.2, whose sampler-visible latent is 128 channels at 1/16 scale: its
+# VAE encodes at 8x into 32 channels and then packs 2x2 spatially into the
+# channel axis (``AutoencoderKLFlux2.encode``, ``patch_size: [2, 2]``), so a
+# 1024px image is a 64x64 grid, not 128x128. ``adaptive_delta`` uses this to
+# hold the coarse/detail step split steady across resolutions -- see
+# ``_resolve_transitions``.
 # =============================================================================
 
+# Latent short side of the reference case every preset's sigma* is quoted at
+# (1024x1024 on an 8x-compression VAE). Also the ``adaptive_delta`` fallback
+# for ``custom``, where the model -- and so its compression -- is unknown.
+REFERENCE_LATENT = 128
+
+# ``adaptive_delta`` safety net: the coarse segments may not consume more than
+# this fraction of the schedule. Never binds on a designed configuration (the
+# presets sit at 33-44%); it exists to stop a compressed schedule from starving
+# the full-resolution segment. See ``_resolve_transitions``.
+MAX_COARSE_FRACTION = 0.5
+
 _PRESETS = {
-    "flux":       {"A": 203.615097, "beta": 1.915461},
-    "wan21":      {"A": 219.484718, "beta": 2.422687},
-    "krea-2":     {"A": 2357.960557, "beta": 2.422687},
-    "krea-2-raw": {"A": 887.402358, "beta": 2.422687},
-    "z-image":    {"A": 877.001476, "beta": 1.915461},
-    "flux2":      {"A": 406.523198, "beta": 1.915461},
+    "flux":       {"A": 203.615097, "beta": 1.915461, "ref_latent": 128},
+    "wan21":      {"A": 219.484718, "beta": 2.422687, "ref_latent": 128},
+    "krea-2":     {"A": 2357.960557, "beta": 2.422687, "ref_latent": 128},
+    "krea-2-raw": {"A": 887.402358, "beta": 2.422687, "ref_latent": 128},
+    "z-image":    {"A": 877.001476, "beta": 1.915461, "ref_latent": 128},
+    "flux2":      {"A": 107.764103, "beta": 1.915461, "ref_latent": 64},
     "custom": None,
 }
 
@@ -232,18 +241,88 @@ def _initial_dct_downscale(x: torch.Tensor, scale: float) -> torch.Tensor:
 def _resolve_transitions(
     sigmas: torch.Tensor, scales: List[float], delta: float, A: float, beta: float,
     H_full: int, W_full: int,
+    adaptive: bool = False, ref_latent: int = REFERENCE_LATENT,
+    log_fn: Callable[[str], None] = None,
 ) -> List[Tuple[int, float, float]]:
-    """Return ``(step_idx, s_i, s_next)`` transitions from ``scales`` and ``delta``."""
+    """Return ``(step_idx, s_i, s_next)`` transitions from ``scales`` and ``delta``.
+
+    With ``adaptive`` set, the transition timing is held at what it would be for
+    a ``ref_latent``-sized latent instead of tracking the actual one.
+
+    Why that is wanted: Eq. 10 evaluates the spectrum at the *coarse grid's own
+    Nyquist frequency* in latent pixels, so the same preset and delta transition
+    progressively later as the canvas grows -- for ``flux`` at 40 steps, 16 of
+    40 steps coarse at 1024x1024 but 22 of 40 at 2048x2048. That is Eq. 10
+    working correctly (a bigger canvas really does keep its high-frequency band
+    noise-dominated for longer), but it inverts the point of the extension: the
+    coarse pass only lays down composition, and giving it a *larger* share of
+    the schedule at high resolution buys nothing while starving the detail
+    pass. Adaptive removes the resolution term so the coarse/detail split stays
+    where the preset was calibrated, with no per-resolution retuning.
+
+    Two guarantees, both one-directional -- adaptive never spends *more* of the
+    schedule at low resolution than the non-adaptive path would:
+
+    1. ``t* = max(t*_reference, t*_actual)``. Below the reference resolution the
+       actual threshold is already the earlier (higher-sigma, more conservative)
+       one, so adaptive is a no-op there rather than making small canvases more
+       aggressive -- at 512x512 a 0.5 first scale is a 256px coarse pass, which
+       is marginal for these models already.
+    2. The coarse segments are capped at ``MAX_COARSE_FRACTION`` of the steps.
+       Threshold pinning alone only neutralises the resolution term; if the
+       *schedule* is also resolution-dependent (ComfyUI's ``ModelSamplingFlux``
+       / SwarmUI's Sigma Shift derive mu from width*height, reaching mu 3.23 at
+       2048x2048 against 1.15 at 1024x1024) it compresses sigma toward 1.0 and
+       pushes the crossing later regardless of the threshold. Unguarded that
+       degenerates -- measured 34/40 coarse steps at 2048, and at 3072 the
+       transition never fires at all and the output stays half-resolution. The
+       cap bounds that failure mode whatever its cause.
+    """
     if len(scales) < 2:
         return []
     t_stars = delta_optimal_transitions(scales, delta, A, beta, H_full, W_full)
-    out: List[Tuple[int, float, float]] = []
     n_steps = len(sigmas) - 1
+
+    if adaptive:
+        t_ref = delta_optimal_transitions(scales, delta, A, beta, ref_latent, ref_latent)
+        pinned = [max(actual, reference) for actual, reference in zip(t_stars, t_ref)]
+        if log_fn is not None and any(
+            abs(a - b) > 1e-9 for a, b in zip(t_stars, pinned)
+        ):
+            omega_max = min(H_full, W_full) / 2.0
+            eq = equivalent_delta(pinned[0], A, beta, scales[0] * omega_max)
+            log_fn(
+                f"adaptive delta: latent {H_full}x{W_full} vs reference "
+                f"{ref_latent}x{ref_latent}; sigma* "
+                f"{', '.join(f'{a:.4f}->{b:.4f}' for a, b in zip(t_stars, pinned))} "
+                f"(delta {delta:g} -> {eq:.6g} equivalent at this resolution)"
+            )
+        t_stars = pinned
+
+    n_transitions = len(scales) - 1
+    out: List[Tuple[int, float, float]] = []
     for i, (s_old, s_new, t_thr) in enumerate(zip(scales[:-1], scales[1:], t_stars)):
         step_idx = next(
             (j for j in range(n_steps) if float(sigmas[j]) <= t_thr),
             n_steps,
         )
+        if adaptive:
+            # Share the coarse budget across the ladder: with one transition the
+            # cap is MAX_COARSE_FRACTION of the schedule, with two the first
+            # lands by half of that, and so on.
+            cap = int(n_steps * MAX_COARSE_FRACTION * (i + 1) / n_transitions)
+            if step_idx > cap:
+                if log_fn is not None:
+                    where = ("never reached in this schedule" if step_idx >= n_steps
+                             else f"step {step_idx}")
+                    log_fn(
+                        f"adaptive delta: {s_old:g}->{s_new:g} transition would land at "
+                        f"{where}; capped to step {cap} of {n_steps} to keep at least "
+                        f"{1.0 - MAX_COARSE_FRACTION:.0%} of the schedule at full "
+                        "resolution. A resolution-dependent schedule shift (ComfyUI "
+                        "ModelSamplingFlux / SwarmUI Sigma Shift) is the usual cause."
+                    )
+                step_idx = cap
         if step_idx >= n_steps:
             break
         out.append((step_idx, s_old, s_new))
@@ -301,6 +380,8 @@ def sample_speed_core(
     spectrum_beta: float = 1.915461,
     manual_sigmas: List[float] = None,
     seed: int = 0,
+    adaptive_delta: bool = False,
+    ref_latent: int = REFERENCE_LATENT,
     sampler_kwargs: dict = None,
     full_res_sampler_kwargs: dict = None,
     log_fn: Callable[[str], None] = None,
@@ -312,6 +393,12 @@ def sample_speed_core(
     ``sampler_kwargs`` are forwarded to every segment; ``full_res_sampler_kwargs``
     only to segments running at the final (1.0) scale — use it for objects tied
     to the full-resolution latent shape, e.g. a Brownian ``noise_sampler``.
+
+    ``adaptive_delta`` holds the coarse/detail step split at the split the
+    preset was calibrated for (``ref_latent``) instead of letting it grow with
+    the canvas; see ``_resolve_transitions``. It only applies to
+    ``delta_optimal`` mode -- ``manual`` thresholds are explicit sigmas and are
+    already resolution-independent.
     """
     extra_args = {} if extra_args is None else extra_args
     sampler_kwargs = dict(sampler_kwargs or {})
@@ -328,6 +415,7 @@ def sample_speed_core(
     if mode == "delta_optimal":
         transitions = _resolve_transitions(
             sigmas, scales, delta, spectrum_A, spectrum_beta, H_full, W_full,
+            adaptive=adaptive_delta, ref_latent=ref_latent, log_fn=log_fn,
         )
     elif mode == "manual":
         transitions = _resolve_manual(sigmas, scales, manual_sigmas or [])
@@ -340,6 +428,13 @@ def sample_speed_core(
             for idx, a, b in transitions
         ) or "none"
         log_fn(f"transitions: {plan}")
+        if transitions:
+            n_steps = len(sigmas) - 1
+            coarse = transitions[-1][0]
+            log_fn(
+                f"schedule split: {coarse}/{n_steps} steps coarse "
+                f"({coarse / n_steps:.0%}), {n_steps - coarse} at full resolution"
+            )
         if len(transitions) < len(scales) - 1:
             log_fn(
                 "warning: not all transitions fit in the schedule; the final "

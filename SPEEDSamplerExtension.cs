@@ -19,6 +19,8 @@ public class SPEEDSamplerExtension : Extension
 
     public static T2IRegisteredParam<double> Delta, SpectrumA, SpectrumBeta;
 
+    public static T2IRegisteredParam<bool> AdaptiveDelta;
+
     public static T2IRegisteredParam<long> SpectralSeed;
 
     public static T2IParamGroup SpeedGroup;
@@ -58,7 +60,10 @@ public class SPEEDSamplerExtension : Extension
             "0.5,1.0", Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 4,
             Examples: ["0.5,1.0", "0.25,0.5,1.0", "0.75,1.0"]
             ));
-        Delta = T2IParamTypes.Register<double>(new("[SPEED] Delta", "[SPEED]\nNoise-dominated tolerance for delta-optimal mode.\nSmaller values delay the transitions to full resolution (higher quality, less speedup).\nIf a transition never fits in the schedule, the backend logs a warning and the output stays coarse - raise this or add steps.",
+        AdaptiveDelta = T2IParamTypes.Register<bool>(new("[SPEED] Adaptive Delta", "[SPEED]\nKeeps the coarse/detail step split at the split the preset was calibrated for (1024x1024) instead of letting the coarse pass grow with the canvas.\nEq. 10 evaluates the latent spectrum at the coarse grid's own Nyquist frequency, so without this the same Delta spends progressively more of the schedule at low resolution as you generate larger - with 'flux' at 40 steps that is 16 of 40 coarse steps at 1024x1024 but 22 of 40 at 2048x2048, starving the detail pass exactly where you need it most.\nThis only ever moves the transition earlier, never later, so it is a no-op at or below 1024x1024 and needs no retuning per resolution.\nApplies to delta-optimal mode only ('manual' sigma thresholds are already resolution-independent).\nTurn this off to reproduce pre-adaptive behaviour exactly.",
+            "true", Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 4.5
+            ));
+        Delta = T2IParamTypes.Register<double>(new("[SPEED] Delta", "[SPEED]\nNoise-dominated tolerance for delta-optimal mode.\nSmaller values delay the transitions to full resolution (higher quality, less speedup).\nWith '[SPEED] Adaptive Delta' on, this is the value at the 1024x1024 reference - exactly the delta the preset table is documented against, applied at any resolution.\nIf a transition never fits in the schedule, the backend logs a warning and the output stays coarse - raise this or add steps.",
             "0.01", Min: 0.0001, Max: 0.5, Step: 0.001, Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 5,
             Examples: ["0.005", "0.01", "0.05"]
             ));
@@ -120,6 +125,7 @@ public class SPEEDSamplerExtension : Extension
                 ["mode"] = g.UserInput.Get(Mode, "delta_optimal"),
                 ["model_preset"] = g.UserInput.Get(ModelPreset, "flux"),
                 ["scales"] = g.UserInput.Get(Scales, "0.5,1.0"),
+                ["adaptive_delta"] = g.UserInput.Get(AdaptiveDelta, true),
                 ["delta"] = g.UserInput.Get(Delta, 0.01),
                 ["manual_sigmas"] = g.UserInput.Get(ManualSigmas, "0.85"),
                 ["spectrum_A"] = g.UserInput.Get(SpectrumA, 203.615097),
