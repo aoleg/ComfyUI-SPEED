@@ -44,6 +44,7 @@ def sample_speed(
     seed: int = 0,
     adaptive_delta: bool = True,
     ref_latent: int = 128,
+    ref_shift: float = None,
     log: bool = True,
 ):
     """Comfy-compatible ``sample_*`` function."""
@@ -63,6 +64,7 @@ def sample_speed(
         spectrum_A=spectrum_A, spectrum_beta=spectrum_beta,
         manual_sigmas=manual_sigmas, seed=seed,
         adaptive_delta=adaptive_delta, ref_latent=ref_latent,
+        ref_shift=ref_shift,
         log_fn=_log if log else None,
     )
 
@@ -189,10 +191,13 @@ class SamplerSPEED(io.ComfyNode):
         if preset is not None:
             A, beta = preset["A"], preset["beta"]
             ref_latent = preset["ref_latent"]
+            ref_shift = preset["ref_shift"]
         else:
             A, beta = float(spectrum_A), float(spectrum_beta)
-            # Unknown model, so unknown VAE compression: assume the 8x case.
+            # Unknown model: assume the 8x VAE case, and leave ref_shift unset
+            # so adaptive falls back to its flat backstop.
             ref_latent = REFERENCE_LATENT
+            ref_shift = None
 
         parsed_scales = _parse_scales(scales)
         parsed_sigmas = _parse_sigmas(manual_sigmas) if mode == "manual" else []
@@ -211,6 +216,7 @@ class SamplerSPEED(io.ComfyNode):
                 "seed": int(seed),
                 "adaptive_delta": bool(adaptive_delta),
                 "ref_latent": int(ref_latent),
+                "ref_shift": ref_shift,
                 "log": bool(log),
             },
         )

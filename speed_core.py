@@ -12,6 +12,7 @@ timestep-aligned.
 """
 from __future__ import annotations
 
+import math
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
@@ -25,6 +26,7 @@ from .spectral_utils import (
     delta_optimal_transitions,
     equivalent_delta,
     kappa,
+    reference_coarse_fraction,
     validate_scales,
 )
 
@@ -110,19 +112,27 @@ from .spectral_utils import (
 # for ``custom``, where the model -- and so its compression -- is unknown.
 REFERENCE_LATENT = 128
 
-# ``adaptive_delta`` safety net: the coarse segments may not consume more than
-# this fraction of the schedule. Never binds on a designed configuration (the
-# presets sit at 33-44%); it exists to stop a compressed schedule from starving
-# the full-resolution segment. See ``_resolve_transitions``.
+# Backstop for ``adaptive_delta`` when the preset declares no ``ref_shift``
+# (i.e. ``custom``, where the model and so its schedule are unknown): the
+# coarse segments may not consume more than this fraction of the schedule.
+# With ``ref_shift`` known the cap is derived from the reference case instead,
+# which is both tighter and meaningful -- see ``_resolve_transitions``.
 MAX_COARSE_FRACTION = 0.5
 
+# ``ref_shift`` is the model's own effective schedule multiplier at the
+# reference resolution, and its units differ by predictor family: it is
+# ``exp(mu)`` for the ``PredictionFlux`` models (Flux's mu 1.15 -> 3.158,
+# FLUX.2's 2.02 -> 7.538) and the raw multiplier for the
+# ``PredictionDiscreteFlow`` ones (Z-Image 3.0, Wan 2.1 8.0). Mixing the two
+# up is the trap documented in knowledge_sigmas.md 5.4. It is used only to
+# convert the reference transition sigma into a reference *step fraction*.
 _PRESETS = {
-    "flux":       {"A": 203.615097, "beta": 1.915461, "ref_latent": 128},
-    "wan21":      {"A": 219.484718, "beta": 2.422687, "ref_latent": 128},
-    "krea-2":     {"A": 2357.960557, "beta": 2.422687, "ref_latent": 128},
-    "krea-2-raw": {"A": 887.402358, "beta": 2.422687, "ref_latent": 128},
-    "z-image":    {"A": 877.001476, "beta": 1.915461, "ref_latent": 128},
-    "flux2":      {"A": 107.764103, "beta": 1.915461, "ref_latent": 64},
+    "flux":       {"A": 203.615097, "beta": 1.915461, "ref_latent": 128, "ref_shift": 3.158193},
+    "wan21":      {"A": 219.484718, "beta": 2.422687, "ref_latent": 128, "ref_shift": 8.0},
+    "krea-2":     {"A": 2357.960557, "beta": 2.422687, "ref_latent": 128, "ref_shift": 3.158193},
+    "krea-2-raw": {"A": 887.402358, "beta": 2.422687, "ref_latent": 128, "ref_shift": 3.158193},
+    "z-image":    {"A": 877.001476, "beta": 1.915461, "ref_latent": 128, "ref_shift": 3.0},
+    "flux2":      {"A": 107.764103, "beta": 1.915461, "ref_latent": 64, "ref_shift": 7.538325},
     "custom": None,
 }
 
@@ -242,6 +252,7 @@ def _resolve_transitions(
     sigmas: torch.Tensor, scales: List[float], delta: float, A: float, beta: float,
     H_full: int, W_full: int,
     adaptive: bool = False, ref_latent: int = REFERENCE_LATENT,
+    ref_shift: float = None,
     log_fn: Callable[[str], None] = None,
 ) -> List[Tuple[int, float, float]]:
     """Return ``(step_idx, s_i, s_next)`` transitions from ``scales`` and ``delta``.
@@ -268,15 +279,26 @@ def _resolve_transitions(
        one, so adaptive is a no-op there rather than making small canvases more
        aggressive -- at 512x512 a 0.5 first scale is a 256px coarse pass, which
        is marginal for these models already.
-    2. The coarse segments are capped at ``MAX_COARSE_FRACTION`` of the steps.
+    2. The coarse share is capped at the share the *reference case* produces.
        Threshold pinning alone only neutralises the resolution term; if the
        *schedule* is also resolution-dependent (ComfyUI's ``ModelSamplingFlux``
        / SwarmUI's Sigma Shift derive mu from width*height, reaching mu 3.23 at
        2048x2048 against 1.15 at 1024x1024) it compresses sigma toward 1.0 and
        pushes the crossing later regardless of the threshold. Unguarded that
        degenerates -- measured 34/40 coarse steps at 2048, and at 3072 the
-       transition never fires at all and the output stays half-resolution. The
-       cap bounds that failure mode whatever its cause.
+       transition never fires at all and the output stays half-resolution.
+
+       A sigma threshold cannot express "the same split" once the schedule
+       itself moves, so the cap is computed as a step *fraction*:
+       ``reference_coarse_fraction(t*_reference, ref_shift)`` inverts the
+       reference schedule to ask what share of steps would sit above the
+       threshold there. For ``flux`` at delta 0.01 that is 35.3%, i.e. 15 of 40
+       steps -- so a 1536x1536 render with Sigma Shift on lands on 15/40 too
+       rather than the flat half-and-half a fixed cap would give. Presets
+       without a ``ref_shift`` (``custom``, where the model is unknown) fall
+       back to ``MAX_COARSE_FRACTION``, and that flat bound also stays on as a
+       backstop for pathological ``delta`` values whose reference split is
+       itself degenerate.
     """
     if len(scales) < 2:
         return []
@@ -307,20 +329,27 @@ def _resolve_transitions(
             n_steps,
         )
         if adaptive:
-            # Share the coarse budget across the ladder: with one transition the
-            # cap is MAX_COARSE_FRACTION of the schedule, with two the first
-            # lands by half of that, and so on.
+            # Flat backstop, shared across the ladder: with one transition it is
+            # MAX_COARSE_FRACTION of the schedule, with two the first lands by
+            # half of that, and so on.
             cap = int(n_steps * MAX_COARSE_FRACTION * (i + 1) / n_transitions)
+            basis = "backstop"
+            if ref_shift:
+                # Preferred: the share the reference case itself would spend
+                # coarse, so a shifted schedule reproduces the reference split
+                # rather than merely being bounded away from the worst case.
+                ref_cap = math.ceil(n_steps * reference_coarse_fraction(t_thr, ref_shift))
+                if ref_cap < cap:
+                    cap, basis = ref_cap, "reference split"
             if step_idx > cap:
                 if log_fn is not None:
                     where = ("never reached in this schedule" if step_idx >= n_steps
                              else f"step {step_idx}")
                     log_fn(
                         f"adaptive delta: {s_old:g}->{s_new:g} transition would land at "
-                        f"{where}; capped to step {cap} of {n_steps} to keep at least "
-                        f"{1.0 - MAX_COARSE_FRACTION:.0%} of the schedule at full "
-                        "resolution. A resolution-dependent schedule shift (ComfyUI "
-                        "ModelSamplingFlux / SwarmUI Sigma Shift) is the usual cause."
+                        f"{where}; capped to step {cap} of {n_steps} ({basis}). A "
+                        "resolution-dependent schedule shift (ComfyUI ModelSamplingFlux "
+                        "/ SwarmUI Sigma Shift) is the usual cause."
                     )
                 step_idx = cap
         if step_idx >= n_steps:
@@ -382,6 +411,7 @@ def sample_speed_core(
     seed: int = 0,
     adaptive_delta: bool = False,
     ref_latent: int = REFERENCE_LATENT,
+    ref_shift: float = None,
     sampler_kwargs: dict = None,
     full_res_sampler_kwargs: dict = None,
     log_fn: Callable[[str], None] = None,
@@ -415,7 +445,8 @@ def sample_speed_core(
     if mode == "delta_optimal":
         transitions = _resolve_transitions(
             sigmas, scales, delta, spectrum_A, spectrum_beta, H_full, W_full,
-            adaptive=adaptive_delta, ref_latent=ref_latent, log_fn=log_fn,
+            adaptive=adaptive_delta, ref_latent=ref_latent, ref_shift=ref_shift,
+            log_fn=log_fn,
         )
     elif mode == "manual":
         transitions = _resolve_manual(sigmas, scales, manual_sigmas or [])

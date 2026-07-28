@@ -140,6 +140,7 @@ def _make_speed_func(base_fn, cfg: dict):
                 spectrum_A=cfg["spectrum_A"], spectrum_beta=cfg["spectrum_beta"],
                 manual_sigmas=cfg["manual_sigmas"], seed=cfg["seed"],
                 adaptive_delta=cfg["adaptive_delta"], ref_latent=cfg["ref_latent"],
+                ref_shift=cfg["ref_shift"],
                 sampler_kwargs=kwargs, full_res_sampler_kwargs=full_res_kwargs,
                 log_fn=_log,
             )
@@ -257,10 +258,13 @@ class SpeedForgeScript(scripts.Script):
         if preset is not None:
             A, beta = preset["A"], preset["beta"]
             ref_latent = preset["ref_latent"]
+            ref_shift = preset["ref_shift"]
         else:
             A, beta = float(spectrum_A), float(spectrum_beta)
-            # Unknown model, so unknown VAE compression: assume the 8x case.
+            # Unknown model: assume the 8x VAE case, and leave ref_shift unset
+            # so adaptive falls back to its flat backstop.
             ref_latent = speed_core.REFERENCE_LATENT
+            ref_shift = None
 
         try:
             parsed_scales = speed_core._parse_scales(scales)
@@ -287,6 +291,7 @@ class SpeedForgeScript(scripts.Script):
             "seed": seed,
             "adaptive_delta": bool(adaptive_delta),
             "ref_latent": int(ref_latent),
+            "ref_shift": ref_shift,
         }
 
         p.extra_generation_params["SPEED"] = (

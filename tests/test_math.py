@@ -200,11 +200,14 @@ class TestAdaptiveDelta(unittest.TestCase):
         ts = [1.0 - i / steps for i in range(steps)]
         return torch.tensor([shift * t / (shift * t + 1.0 - t) for t in ts] + [0.0])
 
-    def _coarse_steps(self, latent, steps=40, mu=1.15, adaptive=False, scales=None):
+    REF_SHIFT = 3.158193                  # flux: exp(mu=1.15)
+
+    def _coarse_steps(self, latent, steps=40, mu=1.15, adaptive=False, scales=None,
+                      ref_shift=None):
         sigmas = self._schedule(steps, mu)
         transitions = _speed_core._resolve_transitions(
             sigmas, scales or [0.5, 1.0], 0.01, self.A, self.BETA, latent, latent,
-            adaptive=adaptive, ref_latent=128)
+            adaptive=adaptive, ref_latent=128, ref_shift=ref_shift)
         return transitions[-1][0] if transitions else steps
 
     def test_without_adaptive_the_coarse_share_grows_with_resolution(self):
@@ -244,6 +247,31 @@ class TestAdaptiveDelta(unittest.TestCase):
         capped = self._coarse_steps(384, steps, mu_3072, adaptive=True)
         self.assertLessEqual(capped, steps * _speed_core.MAX_COARSE_FRACTION)
         self.assertGreater(steps - capped, 0)
+
+    def test_shifted_schedule_reproduces_the_reference_split_not_a_flat_cap(self):
+        # The point of deriving the cap from ref_shift: with a resolution
+        # dependent schedule the result should land on the *reference* split,
+        # not on whatever a flat fraction happens to be. Without ref_shift the
+        # flat backstop gives exactly half the schedule, which is a guardrail
+        # rather than an answer.
+        steps = 40
+        reference = self._coarse_steps(128, steps, adaptive=True, ref_shift=self.REF_SHIFT)
+        for mu in (2.02, 3.23, 6.70):          # 1536, 2048, 3072 px with Sigma Shift
+            with self.subTest(mu=mu):
+                derived = self._coarse_steps(192, steps, mu, adaptive=True,
+                                             ref_shift=self.REF_SHIFT)
+                self.assertEqual(derived, reference)
+                flat = self._coarse_steps(192, steps, mu, adaptive=True)
+                self.assertEqual(flat, steps * _speed_core.MAX_COARSE_FRACTION)
+                self.assertLess(derived, flat)
+
+    def test_reference_cap_does_not_bind_at_the_reference(self):
+        # Deriving the cap must not disturb the case it is derived from.
+        for latent in (64, 96, 128):
+            with self.subTest(latent=latent):
+                self.assertEqual(
+                    self._coarse_steps(latent, adaptive=True, ref_shift=self.REF_SHIFT),
+                    self._coarse_steps(latent, adaptive=False))
 
     def test_cap_does_not_bind_on_a_designed_configuration(self):
         # The safety net must be invisible in normal use.

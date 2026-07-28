@@ -65,6 +65,38 @@ def equivalent_delta(t_star: float, A: float, beta: float, omega: float) -> floa
     return u * P * (1.0 + P) / (1.0 + u * P)
 
 
+def reference_coarse_fraction(t_star: float, shift: float) -> float:
+    """Return the share of a schedule that sits above ``t_star``.
+
+    For a schedule laid out uniformly in flow time ``t``, step ``j`` of ``n``
+    sits at ``t = 1 - j/n`` and carries ``sigma = shift*t / (shift*t + 1 - t)``.
+    Inverting that for the ``t`` where sigma crosses ``t_star`` gives
+    ``T = t_star / (shift*(1 - t_star) + t_star)``, and the steps above the
+    threshold are the ones with ``t > T`` -- a fraction ``1 - T``.
+
+    This is what lets ``adaptive_delta`` express the reference split as a step
+    *fraction* rather than a sigma. A sigma threshold is only equivalent to a
+    fixed split while the schedule is fixed; once the shift moves with
+    resolution the same sigma lands at a different step, and only the fraction
+    survives the change.
+
+    Args:
+    - t_star: Transition sigma at the reference resolution.
+    - shift: Effective schedule multiplier at the reference resolution (the
+      ``exp(mu)`` value for ``PredictionFlux`` models, the raw multiplier for
+      ``PredictionDiscreteFlow`` ones -- they are not the same units).
+
+    Returns:
+    - The coarse share in ``(0, 1)``.
+    """
+    if shift <= 0.0:
+        raise ValueError(f"shift must be positive; got {shift}")
+    if not (0.0 < t_star < 1.0):
+        raise ValueError(f"t_star must be in (0, 1); got {t_star}")
+    T = t_star / (shift * (1.0 - t_star) + t_star)
+    return 1.0 - T
+
+
 def delta_optimal_transitions(
     scales: Sequence[float],
     delta: float,
