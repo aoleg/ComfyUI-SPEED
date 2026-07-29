@@ -92,21 +92,39 @@ Pick the `model_preset` that matches your checkpoint and adjust `scales` and `de
 
 The preset supplies the power spectrum `P(w) = A * w^-beta`; SPEED evaluates it at the coarse grid's Nyquist frequency and converts it into the sigma at which the latent is expanded. The last column is that sigma for the reference case — 1024x1024, `scales=0.5,1.0`, `delta=0.01`.
 
-| Preset | Latent space | Intended for | sigma\* | coarse share |
+| Preset | Latent space | Intended for | sigma\* | basis |
 |---|---|---|---|---|
-| `flux` | Flux VAE | Flux (measured fit, from the official repo) | 0.8527 | 35.3% |
-| `wan21` | Wan 2.1 VAE | Wan 2.1 video (measured fit, from the official repo) | 0.6941 | 77.9% |
-| `krea-2` | Wan 2.1 / Qwen-Image | Few-step Krea 2: the Turbo checkpoint at ~8 steps, or the base model + Turbo LoRA at ~20 steps | 0.9000 | 26.0% |
-| `krea-2-raw` | Wan 2.1 / Qwen-Image | Undistilled Krea 2 base model, 40-50 steps with CFG — transitions later, more speedup | 0.8300 | 39.3% |
-| `z-image` | Flux VAE | Z-Image Turbo, 8-9 steps | 0.9400 | 16.1% |
-| `flux2` | Flux VAE (**unverified**) | FLUX.2 [dev] / Klein, 40-50 steps | 0.9325 † | 35.3% |
+| `flux` | Flux VAE | Flux.1 | 0.9680 | **measured** |
+| `flux2` | Flux VAE (borrowed) | FLUX.2 [dev] / Klein, 40-50 steps | 0.9680 † | **measured** |
+| `wan21` | Wan 2.1 VAE | Wan 2.1 video | 0.6941 | upstream published fit |
+| `krea-2` | Wan 2.1 / Qwen-Image | Few-step Krea 2: the Turbo checkpoint at ~8 steps, or the base model + Turbo LoRA at ~20 steps | 0.9000 | spectrum-derived, untested |
+| `krea-2-raw` | Wan 2.1 / Qwen-Image | Undistilled Krea 2 base model, 40-50 steps with CFG | 0.8300 | spectrum-derived, untested |
+| `z-image` | Flux VAE | Z-Image Turbo, 8-9 steps | 0.9400 | spectrum-derived, untested |
 | `custom` | — | Your own `spectrum_A` / `spectrum_beta` | — | — |
 
 † FLUX.2's sampler latent is 1/16 scale, so its sigma\* is quoted at a 64x64 reference grid; every other preset uses 128x128. Same 1024x1024 image either way.
 
-**Compare presets on the coarse share, not on sigma\*.** A transition sigma is not comparable across models: the share of the schedule it buys depends on the model's shift as well, and those differ by more than 2× here. `flux2` originally shipped at sigma\* 0.9000 because that read as the most conservative number in the table — against FLUX.2's 7.54 shift it was a 45.6% coarse share, making it the *most* aggressive preset rather than the least. It is now pinned to `flux`'s 35.3% share, which is what the sigma was meant to express. (`wan21`'s 77.9% is the upstream measured fit, left as published — it targets video at its own step counts, not 40–50 step stills.)
+#### The quality boundary is a sigma
 
-`flux` and `wan21` are the fits published with the paper. `krea-2`, `krea-2-raw` and `z-image` are **calibrated, not measured**: `beta` is taken from the measured fit for the same VAE latent space (Krea 2 encodes with the Qwen-Image VAE, whose latent format is the Wan 2.1 one; Z-Image uses the Flux VAE), and `A` is solved so that the default `delta` places the transition where the model's step budget wants it. The derivation is in the comment block above `_PRESETS` in `speed_core.py`, and `tests/test_math.py` asserts each sigma\* above.
+`flux` and `flux2` are calibrated from A/B output rather than from the spectrum, and **`flux` no longer ships the published fit** (`A 203.615097`, sigma\* 0.8527 — restorable via `custom`). The measurement that moved it: on Flux.1 dev at 1024x1024, transitioning at sigma 0.9389 renders license-plate text as wrong letters, while 0.9611 renders it correctly. The published threshold of 0.8527 is far below both.
+
+What made this findable is that the boundary is a **sigma**, and it holds across models, resolutions, and schedules differing by 7.6×:
+
+| model | res | coarse/40 | sigma at transition | result |
+|---|---|---|---|---|
+| FLUX.2 | 1536 | 15 | 0.9915 | indistinguishable from off |
+| Flux.1 | 1536 | 15 | 0.9915 | text fine |
+| Flux.1 | 1024 | 12 | 0.9611 | text correct |
+| Flux.1 | 1024 | 15 | 0.9389 | **text broken** |
+| FLUX.2 | 1536 | 29 | 0.9362 | sharp, small details missing |
+| FLUX.2 | 1536 | 33 | 0.8628 | coherent but visibly simpler |
+| FLUX.2 | 1536 | 35 | 0.7762 | **broken** |
+
+Everything at sigma ≥ 0.96 passes. Note the **step counts do not transfer** — Flux.1 needed 28 full-resolution steps at 1024px but only 25 at 1536px, because fine detail lands on more pixels as the canvas grows. Only the sigma is invariant, which is why these presets pin the threshold rather than a step budget. `0.968` reproduces both measured optima (11–12 of 40 coarse at 1024px, 25 of 40 at 1536px).
+
+A consequence worth knowing: under a fixed sigma threshold **SPEED's payoff grows with resolution**, because a larger canvas runs a more compressed schedule and so puts more steps above the threshold. Measured with `flux` at 40 steps: ~1.15× at 1024px on a stock schedule, ~1.9× at 1536px.
+
+The remaining four presets are untouched pending their own A/B. `beta` for `krea-2`/`krea-2-raw`/`z-image` is taken from the measured fit for the same VAE latent space, and `A` solved so the default `delta` places the transition where their step budget wants it; `wan21` is the upstream fit as published. `tests/test_math.py` asserts every sigma\* above.
 
 `flux2` is weaker than that, and is flagged accordingly. FLUX.2's VAE encodes at 8x into 32 channels and then packs 2x2 spatially into the channel axis (`AutoencoderKLFlux2.encode`, `patch_size: [2, 2]`), so the tensor the sampler — and therefore SPEED — actually sees is 128 channels at **1/16 scale**: a 1024x1024 image is a 64x64 grid, not the 128x128 every other preset here works on. Its sigma\* is calibrated at that geometry, which is why its `A` looks small next to `flux`'s despite targeting a *later* transition. Its `beta` is Flux.1's only because that's the closest available analog (same lineage), not because the latents match in shape or channel count — treat it as a starting point and refine with `custom` if you can A/B it. What *is* source-backed: FLUX.2 Klein 4B/9B both declare `shift = 2.02` in ComfyUI's `supported_models.py` (log-space, like Flux.1/Krea 2 — an effective multiplier of `exp(2.02) = 7.54`); no separate entry exists yet for the 32B "dev" checkpoint, so Klein's value is assumed to carry over since all FLUX.2 variants share the same VAE.
 
@@ -115,57 +133,42 @@ Two things drive the calibration:
 - **Few-step models need full-resolution steps more than they need the speedup.** At 8 steps a transition at sigma 0.90 leaves 5 steps at full resolution; the `wan21` threshold of 0.69 leaves 3, and the result goes soft.
 - **The schedule shift moves where a sigma lands.** Krea 2 runs `mu=1.15`, i.e. an effective shift of `exp(1.15) = 3.158` (some ComfyUI workflows raise it to 1.5 -> 4.48), Z-Image Turbo runs a shift of 3.0 (ComfyUI) to 9.0 (Forge Neo preset), and FLUX.2 runs `mu=2.02` (effective 7.54) — all three hold sigma near 1.0 well into the run, so a threshold that reads as "early" actually lands mid-schedule or later.
 
-`delta` stays the speed/quality slider on top of the preset — smaller transitions earlier (better quality, less speedup) — and it keeps working with adaptive delta on, because the cap is derived from the reference split *at your delta* rather than being a fixed number. Halving `delta` is a reasonable "more quality" step; at 40 steps it moves the coarse budget by about a fifth:
+`delta` stays the speed/quality slider on top of the preset — smaller transitions earlier (better quality, less speedup) — and it keeps working with adaptive delta on. Halving `delta` is a reasonable "more quality" step:
 
-| `delta` | `flux` | `flux2` | `krea-2` |
+| `delta` | `flux` @1024 | `flux` @1536 | `krea-2` @ref |
 |---|---|---|---|
-| 0.005 | 12/40 coarse | 12/40 | 8/40 |
-| **0.01** (default) | **15/40** | **15/40** | **11/40** |
-| 0.02 | 18/40 | 18/40 | 14/40 |
-| 0.05 | 23/40 | 23/40 | 18/40 |
+| 0.005 | 10/40 coarse | 23/40 | 8/40 |
+| **0.01** (default) | **11/40** | **25/40** | **11/40** |
+| 0.02 | 13/40 | 27/40 | 14/40 |
+| 0.05 | 16/40 | 30/40 | 18/40 |
+
+(`flux` columns measured on Beta(0.6,0.6); `krea-2` at its own reference. The same `delta` buys many more coarse steps at 1536 than at 1024 — that is the point, see [the sigma boundary](#the-quality-boundary-is-a-sigma).)
 
 Presets are for **flow-matching** models. On eps-prediction checkpoints (SD1.x / SDXL) the delta-optimal threshold is compared against a sigma scale that runs to ~14.6 rather than 1.0, so every preset transitions far later than its own criterion intends; see `docs/sdxl-analysis.md`.
 
 ### Adaptive delta (on by default)
 
-The sigma\* figures above are all for a 1024x1024 generation, and `delta_optimal` is resolution-aware: Eq. 9/10 evaluate the VAE spectrum at the coarse grid's actual Nyquist frequency in latent pixels, not as a fraction of the canvas. Left alone, that means the *same* preset and delta hand a progressively larger share of the schedule to the coarse pass as the canvas grows:
+The sigma\* figures above are for a 1024x1024 generation, and `delta_optimal` is resolution-aware: Eq. 9/10 evaluate the VAE spectrum at the coarse grid's actual Nyquist frequency in latent pixels, not as a fraction of the canvas. So the *same* preset and delta drift toward a later transition as the canvas grows — for `flux` at 1536x1536 that is 29 of 40 steps coarse instead of 25.
 
-| Resolution | `flux` sigma\* | 40 steps, adaptive **off** | 40 steps, adaptive **on** |
-|---|---|---|---|
-| 1024×1024 | 0.8527 | 15 coarse / 25 detail | 15 / 25 |
-| 1536×1536 | 0.7869 | 19 coarse / 21 detail | 15 / 25 |
-| 2048×2048 | 0.7324 | 22 coarse / 18 detail | 15 / 25 |
-| 3072×3072 | 0.6457 | 26 coarse / 14 detail | 15 / 25 |
+**Adaptive delta** pins the threshold to its reference value, `t* = max(t*_reference, t*_actual)`. It is deliberately one-directional — it only ever moves the transition *earlier*, never later — which makes it a no-op at or below 1024x1024, so small canvases don't silently become more aggressive (at 512x512 a `0.5` first scale is a 256px coarse pass, marginal for these models already).
 
-Eq. 10 is not wrong here — a larger canvas really does keep its high-frequency band noise-dominated for longer — but the result inverts the point of the extension. The coarse pass only lays down composition; it does not need 26 of 40 steps to do that, and the steps it takes come straight out of the detail pass, at exactly the resolutions where detail matters most. **Adaptive delta** holds the split where the preset was calibrated instead, with no per-resolution retuning.
+For `flux` and `flux2` that is the whole mechanism, and it is enough: a sigma is invariant across schedules, so the step split it produces adapts on its own. The only other bound is `MAX_COARSE_FRACTION` (80%), a backstop against degeneration rather than a budget — at 40 steps it guarantees 8 full-resolution steps, and measured output only breaks below about 6. It never fires on a configuration anyone runs.
 
-It is deliberately one-directional — it only ever moves the transition *earlier* than the unadapted path, never later — which gives two useful guarantees:
-
-- **A no-op at or below 1024x1024.** Below the reference the unadapted threshold is already the more conservative one and is kept, so small canvases don't silently become more aggressive (at 512x512 a `0.5` first scale is a 256px coarse pass, marginal for these models already).
-- **The reference *share* of steps**, which on strongly shifted schedules is what actually determines the result. Threshold pinning alone only neutralises the resolution term. If the *schedule* is also resolution-dependent — ComfyUI's `ModelSamplingFlux` and SwarmUI's **Sigma Shift** derive mu from `width*height` — it compresses sigma toward 1.0 and pushes the crossing later whatever the threshold says. A FLUX.2-class schedule at 1536x1536 holds sigma above 0.93 for **30 of 40 steps**; unheld, that run gives 33/40 coarse, and at 3072x3072 the transition never fires at all and the output stays half-resolution.
-
-  A sigma threshold simply cannot express "the same split" once the schedule itself moves, so the second constraint is a step **fraction**. Each preset declares `ref_shift`, the model's own effective schedule multiplier at 1024x1024, and inverting that schedule gives the share of steps that would sit above the threshold there — 35.3% for `flux` at `delta=0.01`, i.e. 15 of 40 steps:
-
-  | With Sigma Shift on | adaptive off | adaptive on |
-  |---|---|---|
-  | 1024×1024 | 15 / 25 | 15 / 25 |
-  | 1536×1536 | 27 / 13 | **15 / 25** |
-  | 2048×2048 | 37 / 3 | **15 / 25** |
-  | 3072×3072 | 40 / 0 (never transitions) | **15 / 25** |
-
-  This is a calculation, not a clamp on one: it is derived from the preset and `delta` and moves with both — `flux2` at 40 steps gives 9 coarse steps at `delta=0.0025`, 15 at `0.01`, 23 at `0.05`. On these schedules it is the share that decides the outcome and the threshold pin that reaches it indirectly, by tightening the share (20/40 → 15/40 in the 1536x1536 case above). `MAX_COARSE_FRACTION` (50%) is the one arbitrary number involved and applies **only** to `custom`, which declares no `ref_shift` because its model — and so its schedule — is unknown.
+The four presets still on a spectrum-derived threshold (`krea-2`, `krea-2-raw`, `z-image`, `wan21`) additionally hold the coarse **share**, because an uncalibrated sigma lands too late once the schedule is compressed. ComfyUI's `ModelSamplingFlux` and SwarmUI's **Sigma Shift** derive mu from `width*height`, and a FLUX.2-class schedule at 1536x1536 holds sigma above 0.93 for 30 of 40 steps; unheld, such a run gives 33/40 coarse, and at 3072x3072 the transition never fires at all and the output stays half-resolution. Those presets declare `ref_shift`, the model's effective schedule multiplier at 1024x1024, and inverting that schedule gives the share of steps sitting above the threshold there. A preset with a measured sigma carries no `ref_shift` — the cap would override it, demanding 5 of 40 steps for `flux` where the measured-correct answer is 11.
 
 Turn it off to reproduce pre-adaptive behaviour exactly. `delta` keeps its meaning either way — with adaptive on it is the value **at the 1024x1024 reference**, i.e. exactly the delta the preset table above is documented against, applied at any resolution. The console reports what it did:
 
 ```
-[SPEED] adaptive delta: latent 192x192 vs reference 128x128; sigma* 0.7869->0.8527 (delta 0.01 -> 0.00409 equivalent at this resolution)
-[SPEED] transitions: step 15: 0.5->1 (sigma=0.8473)
-[SPEED] schedule split: 15/40 steps coarse (38%), 25 at full resolution
+[SPEED] adaptive delta: latent 192x192 vs reference 128x128; sigma* 0.9518->0.9680 (delta 0.01 -> 0.00567 equivalent at this resolution)
+[SPEED] transitions: step 25: 0.5->1 (sigma=0.9656)
+[SPEED] schedule split: 25/40 steps coarse (62%), 15 at full resolution
 ```
 
 ### manual mode
 
 Set `mode=manual` and supply comma-separated sigma thresholds in `manual_sigmas` (one per transition between adjacent scales). Sigma decreases as denoising progresses, so the first threshold should be larger than the last (e.g. `0.95,0.85` for three scales).
+
+Because the quality boundary is a sigma, manual mode is the most direct expression of it: `manual_sigmas=0.968` reproduces what `flux`/`flux2` do at any resolution, on any schedule, with no preset or adaptive logic involved. Useful for calibrating a model that has no preset yet — sweep the threshold, find where your hardest detail (small text is a good probe) starts to fail, and back off from there.
 
 ## Credits & license
 

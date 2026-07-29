@@ -192,7 +192,8 @@ class SpeedForgeScript(scripts.Script):
                     info="Power-spectrum fit used by delta_optimal mode. krea-2 = few-step "
                          "Krea 2 (Turbo, or base + Turbo LoRA); krea-2-raw = base model at "
                          "40-50 steps with CFG; z-image = Z-Image Turbo; flux2 = FLUX.2 at "
-                         "40-50 steps (no measured spectrum fit -- a starting point).",
+                         "40-50 steps. flux/flux2 are calibrated from measured output; "
+                         "the rest are spectrum-derived and untested.",
                 )
                 # The preset list is defined by this extension, so keep a stale
                 # ui-config.json entry from restoring a value we no longer offer.
@@ -258,7 +259,7 @@ class SpeedForgeScript(scripts.Script):
         if preset is not None:
             A, beta = preset["A"], preset["beta"]
             ref_latent = preset["ref_latent"]
-            ref_shift = preset["ref_shift"]
+            ref_shift = preset.get("ref_shift")   # absent once a preset is measured-calibrated
         else:
             A, beta = float(spectrum_A), float(spectrum_beta)
             # Unknown model: assume the 8x VAE case, and leave ref_shift unset

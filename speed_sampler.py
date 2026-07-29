@@ -114,17 +114,17 @@ class SamplerSPEED(io.ComfyNode):
                 io.Combo.Input(
                     "model_preset", options=list(_PRESETS.keys()), default="flux",
                     tooltip="Power-spectrum preset for delta-optimal mode. `flux` and "
-                            "`wan21` use the measured (A, beta) fits. `krea-2` targets "
+                            "`flux2` are calibrated from measured A/B output (sigma* 0.968); "
+                            "`wan21` is the upstream published fit. `krea-2` targets "
                             "few-step Krea 2 (the Turbo checkpoint at ~8 steps, or the "
                             "base model with the Turbo LoRA at ~20 steps); `krea-2-raw` "
                             "targets the undistilled base model at 40-50 steps with CFG "
                             "and transitions later for more speedup; `z-image` targets "
                             "Z-Image Turbo; `flux2` targets FLUX.2 [dev]/Klein at 40-50 "
-                            "steps, but has no measured spectrum fit -- treat it as a "
-                            "starting point. `custom` uses the manual A / beta inputs "
-                            "below. All sigma* targets are calibrated at 1024x1024; "
-                            "generating larger pushes the transition later for the same "
-                            "delta (see `log`).",
+                            "steps (its beta is borrowed from Flux.1 -- no measured "
+                            "spectrum fit exists for FLUX.2's VAE). `custom` uses the "
+                            "manual A / beta inputs below. sigma* is quoted at 1024x1024; "
+                            "see `log` for where a run actually landed.",
                 ),
                 io.String.Input(
                     "scales", default="0.5,1.0",
@@ -139,10 +139,10 @@ class SamplerSPEED(io.ComfyNode):
                             "coarse grid's own Nyquist frequency, so without this the "
                             "same `delta` spends progressively more of the schedule at "
                             "low resolution as you generate larger -- for `flux` at 40 "
-                            "steps, 16/40 coarse steps at 1024x1024 but 22/40 at "
-                            "2048x2048, which starves the detail pass exactly where you "
-                            "need it. Only ever transitions earlier than the unadapted "
-                            "path, never later, so it is a no-op at or below 1024x1024. "
+                            "steps, 25/40 coarse at 1536x1536 becomes 29/40 unadapted, "
+                            "which starves the detail pass exactly where you need it. "
+                            "Only ever transitions earlier than the unadapted path, "
+                            "never later, so it is a no-op at or below 1024x1024. "
                             "Applies to delta_optimal mode only.",
                 ),
                 io.Float.Input(
@@ -191,7 +191,7 @@ class SamplerSPEED(io.ComfyNode):
         if preset is not None:
             A, beta = preset["A"], preset["beta"]
             ref_latent = preset["ref_latent"]
-            ref_shift = preset["ref_shift"]
+            ref_shift = preset.get("ref_shift")   # absent once a preset is measured-calibrated
         else:
             A, beta = float(spectrum_A), float(spectrum_beta)
             # Unknown model: assume the 8x VAE case, and leave ref_shift unset

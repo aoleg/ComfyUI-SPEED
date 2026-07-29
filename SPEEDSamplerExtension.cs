@@ -29,7 +29,7 @@ public class SPEEDSamplerExtension : Extension
         "krea-2///Krea 2 (Turbo / Turbo LoRA)",
         "krea-2-raw///Krea 2 (raw base, CFG)",
         "z-image///Z-Image Turbo",
-        "flux2///FLUX.2 (dev / Klein, unverified fit)",
+        "flux2///FLUX.2 (dev / Klein)",
         "custom///Custom (A / beta below)"
     ];
 
@@ -71,7 +71,7 @@ public class SPEEDSamplerExtension : Extension
             "delta_optimal", Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 2,
             GetValues: (_) => ["delta_optimal///Delta-Optimal (automatic)", "manual///Manual sigma thresholds"]
             ));
-        ModelPreset = T2IParamTypes.Register<string>(new("[SPEED] Model Preset", "[SPEED]\nPower-spectrum preset for delta-optimal mode.\n'flux' and 'wan21' use the measured (A, beta) fits.\n'krea-2' targets few-step Krea 2 - the Turbo checkpoint at ~8 steps, or the base model with the Turbo LoRA at ~20 steps.\n'krea-2-raw' targets the undistilled Krea 2 base model at 40-50 steps with CFG, and transitions later for more speedup.\n'z-image' targets Z-Image Turbo.\n'flux2' targets FLUX.2 [dev] / Klein at 40-50 steps - unlike the others this has no measured spectrum fit, treat it as a starting point to refine with 'custom'.\n'custom' uses the '[SPEED] Spectrum A' / '[SPEED] Spectrum Beta' inputs, which only show once 'custom' is selected.\nAll preset targets are calibrated at 1024x1024 - delta-optimal is resolution-aware by design, so generating larger pushes the transition later (more of the run at low resolution) for the same preset and delta. Watch the backend console's '[SPEED] transitions:' line to see where it actually landed.",
+        ModelPreset = T2IParamTypes.Register<string>(new("[SPEED] Model Preset", "[SPEED]\nPower-spectrum preset for delta-optimal mode.\n'flux' and 'flux2' are calibrated from measured A/B output and pin a transition sigma of 0.968 - the boundary below which fine detail (small text is the harshest probe) starts to fail. Note 'flux' therefore no longer ships the paper's published fit; select 'custom' with A 203.615097 / beta 1.915461 to restore it.\n'wan21' is the upstream published fit.\n'krea-2' targets few-step Krea 2 - the Turbo checkpoint at ~8 steps, or the base model with the Turbo LoRA at ~20 steps.\n'krea-2-raw' targets the undistilled Krea 2 base model at 40-50 steps with CFG, and transitions later for more speedup.\n'z-image' targets Z-Image Turbo. Those three are spectrum-derived and not yet A/B tested.\n'custom' uses the '[SPEED] Spectrum A' / '[SPEED] Spectrum Beta' inputs, which only show once 'custom' is selected.\nsigma* is quoted at 1024x1024. Watch the backend console's '[SPEED] transitions:' line to see where a run actually landed.",
             "flux", Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 3,
             GetValues: (_) => [.. ModelPresets]
             ));

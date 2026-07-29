@@ -109,24 +109,27 @@ class TestPresets(unittest.TestCase):
     """
 
     REFERENCE_SIGMA = {
-        "flux": 0.8527,
+        "flux": 0.9680,        # measured
         "wan21": 0.6941,
         "krea-2": 0.9000,
         "krea-2-raw": 0.8300,
         "z-image": 0.9400,
-        "flux2": 0.9325,
+        "flux2": 0.9680,       # measured
     }
 
-    # Share of the schedule spent coarse at the reference. This is the number
-    # that is comparable across presets -- sigma* is not, because the share it
-    # buys also depends on the model's shift.
+    # The sigma anchor both measured presets share. Everything at or above this
+    # passed A/B on two models, two resolutions and two schedules; 0.9389 is the
+    # nearest measured failure (Flux.1 license-plate text at 1024x1024).
+    MEASURED_ANCHOR = 0.9680
+
+    # Share of the schedule spent coarse at the reference. Only meaningful for
+    # presets still on the spectrum-derived threshold, which are the ones that
+    # keep the step-fraction cap.
     REFERENCE_COARSE_SHARE = {
-        "flux": 0.3531,
         "wan21": 0.7790,
         "krea-2": 0.2598,
         "krea-2-raw": 0.3928,
         "z-image": 0.1607,
-        "flux2": 0.3531,
     }
 
     def _sigma_star(self, preset, scale=0.5, delta=0.01, latent=None):
@@ -181,12 +184,13 @@ class TestPresets(unittest.TestCase):
         # spectrum is weaker and the transition lands far later than the target
         # -- which is exactly the bug this preset shipped with first.
         preset = _speed_core._PRESETS["flux2"]
-        self.assertAlmostEqual(self._sigma_star(preset, latent=64), 0.9325, places=4)
-        self.assertLess(self._sigma_star(preset, latent=128), 0.90)
+        self.assertAlmostEqual(self._sigma_star(preset, latent=64),
+                               self.MEASURED_ANCHOR, places=4)
+        self.assertLess(self._sigma_star(preset, latent=128), self.MEASURED_ANCHOR)
 
     def test_documented_reference_coarse_shares(self):
-        # The comparable quantity across presets. Pinning it catches a preset
-        # whose sigma looks conservative but whose schedule share is not.
+        # Only the spectrum-derived presets carry a share; the measured ones
+        # deliberately do not (their sigma is the answer).
         for name, expected in self.REFERENCE_COARSE_SHARE.items():
             with self.subTest(preset=name):
                 preset = _speed_core._PRESETS[name]
@@ -194,19 +198,32 @@ class TestPresets(unittest.TestCase):
                     self._sigma_star(preset), preset["ref_shift"])
                 self.assertAlmostEqual(share, expected, places=4)
 
-    def test_flux2_shares_flux_step_budget_despite_a_stronger_shift(self):
-        # flux2's shift is 2.4x flux's, so matching sigma would *not* match the
-        # step split -- the two must agree on the share, not on the threshold.
-        def share(name):
-            preset = _speed_core._PRESETS[name]
-            return _spectral.reference_coarse_fraction(
-                self._sigma_star(preset), preset["ref_shift"])
-        self.assertAlmostEqual(share("flux2"), share("flux"), places=4)
-        self.assertGreater(_speed_core._PRESETS["flux2"]["ref_shift"],
-                           2 * _speed_core._PRESETS["flux"]["ref_shift"])
-        self.assertNotAlmostEqual(self._sigma_star(_speed_core._PRESETS["flux2"]),
-                                  self._sigma_star(_speed_core._PRESETS["flux"]),
-                                  places=2)
+    def test_measured_presets_carry_no_ref_shift(self):
+        # ref_shift enables the step-fraction cap, which exists to compensate
+        # for an uncalibrated threshold. A measured threshold must not be
+        # overridden by it -- for flux the cap would demand 5 of 40 steps where
+        # the measured-correct answer is 11.
+        for name in ("flux", "flux2"):
+            with self.subTest(preset=name):
+                self.assertNotIn("ref_shift", _speed_core._PRESETS[name])
+        for name in ("wan21", "krea-2", "krea-2-raw", "z-image"):
+            with self.subTest(preset=name):
+                self.assertIn("ref_shift", _speed_core._PRESETS[name])
+
+    def test_measured_presets_share_the_sigma_anchor(self):
+        # The quality boundary is a sigma and it transferred across models, so
+        # both calibrated presets pin the same one despite different geometry.
+        for name in ("flux", "flux2"):
+            with self.subTest(preset=name):
+                self.assertAlmostEqual(self._sigma_star(_speed_core._PRESETS[name]),
+                                       self.MEASURED_ANCHOR, places=4)
+        self.assertNotEqual(_speed_core._PRESETS["flux"]["ref_latent"],
+                            _speed_core._PRESETS["flux2"]["ref_latent"])
+
+    def test_anchor_sits_above_the_measured_failure(self):
+        # Flux.1 at 1024x1024 rendered text correctly transitioning at 0.9611
+        # and incorrectly at 0.9389. The anchor must clear the failure.
+        self.assertGreater(self.MEASURED_ANCHOR, 0.9611)
 
     def test_flux2_beta_is_borrowed_not_matched(self):
         # Unlike krea-2/z-image (an exact VAE match), flux2's beta is only the
@@ -285,11 +302,9 @@ class TestAdaptiveDelta(unittest.TestCase):
         self.assertGreater(steps - capped, 0)
 
     def test_shifted_schedule_reproduces_the_reference_split_not_a_flat_cap(self):
-        # The point of deriving the cap from ref_shift: with a resolution
-        # dependent schedule the result should land on the *reference* split,
-        # not on whatever a flat fraction happens to be. Without ref_shift the
-        # flat backstop gives exactly half the schedule, which is a guardrail
-        # rather than an answer.
+        # For a preset still on the spectrum-derived threshold, a resolution
+        # dependent schedule should land on the *reference* split rather than
+        # wherever the sigma alone crosses.
         steps = 40
         reference = self._coarse_steps(128, steps, adaptive=True, ref_shift=self.REF_SHIFT)
         for mu in (2.02, 3.23, 6.70):          # 1536, 2048, 3072 px with Sigma Shift
@@ -297,24 +312,25 @@ class TestAdaptiveDelta(unittest.TestCase):
                 derived = self._coarse_steps(192, steps, mu, adaptive=True,
                                              ref_shift=self.REF_SHIFT)
                 self.assertEqual(derived, reference)
-                flat = self._coarse_steps(192, steps, mu, adaptive=True)
-                self.assertEqual(flat, steps * _speed_core.MAX_COARSE_FRACTION)
-                self.assertLess(derived, flat)
+                # Without ref_shift the sigma governs and lands much later.
+                unheld = self._coarse_steps(192, steps, mu, adaptive=True)
+                self.assertGreater(unheld, derived)
 
     def test_derived_share_wins_over_the_flat_backstop(self):
         # The flat fraction is arbitrary; the derived share is not. When a
         # preset declares ref_shift the derived value must be used even where
         # it is the more permissive of the two, otherwise a large delta silently
-        # stops meaning what it says.
-        steps, delta = 40, 0.05
+        # stops meaning what it says. delta 0.5 is chosen because its derived
+        # share (34/40) sits above the backstop (32/40).
+        steps, delta = 40, 0.5
         sigmas = self._schedule(steps, mu=6.70)
         transitions = _speed_core._resolve_transitions(
             sigmas, [0.5, 1.0], delta, self.A, self.BETA, 192, 192,
             adaptive=True, ref_latent=128, ref_shift=self.REF_SHIFT)
         t_ref = delta_optimal_transitions([0.5, 1.0], delta, self.A, self.BETA, 128, 128)[0]
         expected = math.ceil(steps * _spectral.reference_coarse_fraction(t_ref, self.REF_SHIFT))
-        self.assertEqual(transitions[-1][0], expected)
         self.assertGreater(expected, steps * _speed_core.MAX_COARSE_FRACTION)
+        self.assertEqual(transitions[-1][0], expected)
 
     def test_flat_backstop_still_applies_without_a_ref_shift(self):
         # `custom` has no model to derive a share from, so the arbitrary bound
