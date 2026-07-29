@@ -199,9 +199,16 @@ class SpeedForgeScript(scripts.Script):
                          "40-50 steps. flux/flux2 are calibrated from measured output; "
                          "the rest are spectrum-derived and untested.",
                 )
-                # The preset list is defined by this extension, so keep a stale
-                # ui-config.json entry from restoring a value we no longer offer.
-                model_preset.do_not_save_to_config = True
+                # Persisted normally (no do_not_save_to_config): a preset this
+                # extension no longer offers doesn't need special-casing here.
+                # Forge Neo's own ui_loadsave.py already guards every gr.Dropdown
+                # against restoring a stale value -- `check_dropdown` in
+                # modules/ui_loadsave.py only restores a saved value that is
+                # still in the component's current `choices`; otherwise it
+                # silently keeps this constructor's `value="flux"` default. And
+                # even in the hypothetical it didn't, `before_process_batch`'s
+                # `_PRESETS.get(model_preset)` already treats an unrecognized
+                # name as "custom" rather than erroring.
             with gr.Row():
                 scales = gr.Textbox(
                     value="0.5,1.0", label="Scales",
