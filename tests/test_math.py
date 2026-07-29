@@ -362,6 +362,75 @@ class TestAdaptiveDelta(unittest.TestCase):
         self.assertEqual(indices, sorted(indices))
         self.assertLessEqual(indices[-1], 40 * _speed_core.MAX_COARSE_FRACTION)
 
+    def test_sigma_divisor_of_one_is_an_exact_noop(self):
+        # neo_shift's whole selling point: divisor=1.0 must reproduce plain
+        # delta_optimal exactly, not just approximately.
+        sigmas = self._schedule(40)
+        with_default = _speed_core._resolve_transitions(
+            sigmas, [0.5, 1.0], 0.01, self.A, self.BETA, 128, 128,
+            adaptive=True, ref_latent=128, sigma_divisor=1.0)
+        without = _speed_core._resolve_transitions(
+            sigmas, [0.5, 1.0], 0.01, self.A, self.BETA, 128, 128,
+            adaptive=True, ref_latent=128)
+        self.assertEqual(with_default, without)
+
+    def test_higher_sigma_divisor_gives_more_coarse_steps(self):
+        # Divisor > 1 lowers the threshold -> transitions later -> more speed.
+        baseline = self._coarse_steps(128, adaptive=True)
+        sigmas = self._schedule(40)
+        divided = _speed_core._resolve_transitions(
+            sigmas, [0.5, 1.0], 0.01, self.A, self.BETA, 128, 128,
+            adaptive=True, ref_latent=128, sigma_divisor=1.03)
+        self.assertGreater(divided[-1][0], baseline)
+
+    def test_lower_sigma_divisor_gives_fewer_coarse_steps(self):
+        # Divisor < 1 raises the threshold -> transitions earlier -> more conservative.
+        baseline = self._coarse_steps(128, adaptive=True)
+        sigmas = self._schedule(40)
+        divided = _speed_core._resolve_transitions(
+            sigmas, [0.5, 1.0], 0.01, self.A, self.BETA, 128, 128,
+            adaptive=True, ref_latent=128, sigma_divisor=0.9)
+        self.assertLess(divided[-1][0], baseline)
+
+    def test_sigma_divisor_applies_regardless_of_adaptive(self):
+        # neo_shift is "delta_optimal plus a divisor" either way adaptive_delta
+        # is set -- the divide must not be gated on the adaptive branch.
+        sigmas = self._schedule(40)
+        without_adaptive = _speed_core._resolve_transitions(
+            sigmas, [0.5, 1.0], 0.01, self.A, self.BETA, 128, 128,
+            adaptive=False, sigma_divisor=1.0)
+        divided = _speed_core._resolve_transitions(
+            sigmas, [0.5, 1.0], 0.01, self.A, self.BETA, 128, 128,
+            adaptive=False, sigma_divisor=1.03)
+        self.assertGreater(divided[-1][0], without_adaptive[-1][0])
+
+    def test_sigma_divisor_applies_to_every_transition(self):
+        sigmas = self._schedule(40)
+        baseline = _speed_core._resolve_transitions(
+            sigmas, [0.25, 0.5, 1.0], 0.01, self.A, self.BETA, 128, 128,
+            adaptive=True, ref_latent=128)
+        divided = _speed_core._resolve_transitions(
+            sigmas, [0.25, 0.5, 1.0], 0.01, self.A, self.BETA, 128, 128,
+            adaptive=True, ref_latent=128, sigma_divisor=1.03)
+        self.assertEqual(len(divided), len(baseline))
+        for i in range(len(baseline)):
+            with self.subTest(transition=i):
+                self.assertGreaterEqual(divided[i][0], baseline[i][0])
+
+    def test_sigma_divisor_logs_only_when_not_a_noop(self):
+        sigmas = self._schedule(40)
+        logged = []
+        _speed_core._resolve_transitions(
+            sigmas, [0.5, 1.0], 0.01, self.A, self.BETA, 128, 128,
+            adaptive=True, ref_latent=128, sigma_divisor=1.0, log_fn=logged.append)
+        self.assertFalse(any("neo_shift" in m for m in logged))
+
+        logged.clear()
+        _speed_core._resolve_transitions(
+            sigmas, [0.5, 1.0], 0.01, self.A, self.BETA, 128, 128,
+            adaptive=True, ref_latent=128, sigma_divisor=1.03, log_fn=logged.append)
+        self.assertTrue(any("neo_shift" in m for m in logged))
+
     def test_equivalent_delta_round_trips(self):
         # The number reported in the adaptive log line must actually reproduce
         # the pinned threshold at the frequency it is quoted for.

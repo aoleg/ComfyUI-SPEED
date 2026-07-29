@@ -125,7 +125,7 @@ def _make_speed_func(base_fn, cfg: dict):
 
         _log(f"pass start: x={tuple(x.shape)}, steps={len(sigmas) - 1}, "
              f"sigmas {float(sigmas[0]):.4f}->{float(sigmas[-2]):.4f}, "
-             f"mode={cfg['mode']}, transform={cfg['transform']}, "
+             f"mode={cfg['mode_label']}, transform={cfg['transform']}, "
              f"scales={cfg['scales']}, seed={cfg['seed']}")
 
         import k_diffusion.sampling as kds
@@ -140,7 +140,7 @@ def _make_speed_func(base_fn, cfg: dict):
                 spectrum_A=cfg["spectrum_A"], spectrum_beta=cfg["spectrum_beta"],
                 manual_sigmas=cfg["manual_sigmas"], seed=cfg["seed"],
                 adaptive_delta=cfg["adaptive_delta"], ref_latent=cfg["ref_latent"],
-                ref_shift=cfg["ref_shift"],
+                ref_shift=cfg["ref_shift"], sigma_divisor=cfg["sigma_divisor"],
                 sampler_kwargs=kwargs, full_res_sampler_kwargs=full_res_kwargs,
                 log_fn=_log,
             )
@@ -183,8 +183,12 @@ class SpeedForgeScript(scripts.Script):
                     info="Spectral basis at each transition. DWT needs 2x scale steps and PyWavelets.",
                 )
                 mode = gr.Radio(
-                    choices=["delta_optimal", "manual"], value="delta_optimal", label="Mode",
-                    info="delta_optimal: from power-spectrum preset; manual: explicit sigma thresholds.",
+                    choices=["neo_shift", "delta_optimal", "manual"], value="neo_shift",
+                    label="Mode",
+                    info="neo_shift: delta_optimal plus the Sigma divisor below, tuned for "
+                         "this webui's fixed (non-resolution-shifted) Flux/FLUX.2 schedule; "
+                         "delta_optimal: power-spectrum preset as calibrated upstream; "
+                         "manual: explicit sigma thresholds.",
                 )
                 model_preset = gr.Dropdown(
                     choices=list(speed_core._PRESETS.keys()), value="flux",
@@ -216,6 +220,18 @@ class SpeedForgeScript(scripts.Script):
                              "(delta_optimal). With Adaptive delta on, this is the value "
                              "at the 1024x1024 reference.",
                     )
+                    sigma_divisor = gr.Slider(
+                        minimum=0.5, maximum=2.0, step=0.01, value=1.03,
+                        label="Sigma divisor",
+                        info="neo_shift mode only. Divides the resolved sigma* by this "
+                             "value before the step lookup. 1.0 exactly matches "
+                             "delta_optimal (mathematically a no-op). Higher = lower "
+                             "threshold = more coarse steps = more speed (and more "
+                             "quality risk); lower = fewer coarse steps = more "
+                             "conservative. Default 1.03 was measured on this webui's "
+                             "flat (non-resolution-shifted) Flux schedule at 1024x1024, "
+                             "Euler/Beta -- re-check it if your sampler/scheduler differ.",
+                    )
             with gr.Row():
                 manual_sigmas = gr.Textbox(
                     value="0.85", label="Manual sigmas",
@@ -240,12 +256,13 @@ class SpeedForgeScript(scripts.Script):
             )
 
         return [enabled, transform, mode, model_preset, scales, adaptive_delta,
-                delta, manual_sigmas, spectrum_A, spectrum_beta, seed, apply_hr]
+                delta, sigma_divisor, manual_sigmas, spectrum_A, spectrum_beta,
+                seed, apply_hr]
 
     def before_process_batch(self, p, enabled, transform, mode, model_preset,
-                             scales, adaptive_delta, delta, manual_sigmas,
-                             spectrum_A, spectrum_beta, seed, apply_hr,
-                             *args, **kwargs):
+                             scales, adaptive_delta, delta, sigma_divisor,
+                             manual_sigmas, spectrum_A, spectrum_beta, seed,
+                             apply_hr, *args, **kwargs):
         cls = SpeedForgeScript
         cls.enabled = bool(enabled)
         cls.config = None
@@ -267,6 +284,13 @@ class SpeedForgeScript(scripts.Script):
             ref_latent = speed_core.REFERENCE_LATENT
             ref_shift = None
 
+        # neo_shift is delta_optimal plus sigma_divisor; it is a Forge Neo UI
+        # label only, never passed to speed_core -- see speed_core.py's
+        # `_PRESETS` comment block for why the correction lives here instead
+        # of in the shared preset table.
+        core_mode = "delta_optimal" if mode == "neo_shift" else mode
+        resolved_divisor = float(sigma_divisor) if mode == "neo_shift" else 1.0
+
         try:
             parsed_scales = speed_core._parse_scales(scales)
             parsed_sigmas = (speed_core._parse_sigmas(manual_sigmas, upper=None)
@@ -283,7 +307,8 @@ class SpeedForgeScript(scripts.Script):
 
         cls.config = {
             "transform": transform,
-            "mode": mode,
+            "mode": core_mode,
+            "mode_label": mode,   # raw UI selection, for logging/metadata only
             "scales": parsed_scales,
             "delta": float(delta),
             "spectrum_A": A,
@@ -293,11 +318,13 @@ class SpeedForgeScript(scripts.Script):
             "adaptive_delta": bool(adaptive_delta),
             "ref_latent": int(ref_latent),
             "ref_shift": ref_shift,
+            "sigma_divisor": resolved_divisor,
         }
 
         p.extra_generation_params["SPEED"] = (
             f"{transform}/{mode}/{model_preset} scales={scales} delta={delta} "
-            + ("adaptive " if adaptive_delta and mode == "delta_optimal" else "")
+            + ("adaptive " if adaptive_delta and core_mode == "delta_optimal" else "")
+            + (f"sigma_divisor={sigma_divisor} " if mode == "neo_shift" else "")
             + (f"manual_sigmas={manual_sigmas} " if mode == "manual" else "")
             + f"seed={seed}"
         )

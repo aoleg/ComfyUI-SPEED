@@ -169,6 +169,25 @@ MAX_COARSE_FRACTION = 0.8
 # would demand 5 of 40 steps where the measured-correct answer is 11). ``flux``
 # and ``flux2`` are in that state; the rest still run the spectrum-derived
 # threshold and keep the cap that compensates for it.
+#
+# ``sigma_divisor`` (``_resolve_transitions``, ``sample_speed_core``) is a
+# different kind of correction from either of the above: not a per-preset
+# constant, but a per-*backend* one. The measured sigma anchor (0.9680) was
+# calibrated where the effective schedule shift grows with resolution
+# (ComfyUI's ``ModelSamplingFlux`` / SwarmUI's Sigma Shift). Forge Neo runs
+# Flux and FLUX.2 at a flat `mu=1.15` regardless of canvas size -- there is no
+# user-facing Shift control for those models in that webui -- so the same
+# sigma threshold crosses far earlier in step-count terms there than on a
+# backend that does shift. A live binary search on Forge Neo (Euler/Beta,
+# 1024x1024, seed 42, both 20 and 40 total steps) found the true quality floor
+# at sigma ~0.9249, not 0.968, and reproduced it at both step counts once the
+# schedule (shift + spacing) was held fixed -- confirming sigma is still the
+# invariant *within one schedule family*, just not transferable across a
+# schedule-shift change. ``sigma_divisor`` lets the ``neo_shift`` Forge Neo UI
+# mode apply that backend-specific correction directly, without touching the
+# shared calibration every other consumer (the ComfyUI node, SwarmUI) relies
+# on. See ``scripts/speed_forge.py`` for where it's exposed, and the README's
+# "neo_shift mode" section for the measurement.
 _PRESETS = {
     "flux":       {"A": 1963.48906, "beta": 1.915461, "ref_latent": 128},
     "wan21":      {"A": 219.484718, "beta": 2.422687, "ref_latent": 128, "ref_shift": 8.0},
@@ -296,6 +315,7 @@ def _resolve_transitions(
     H_full: int, W_full: int,
     adaptive: bool = False, ref_latent: int = REFERENCE_LATENT,
     ref_shift: float = None,
+    sigma_divisor: float = 1.0,
     log_fn: Callable[[str], None] = None,
 ) -> List[Tuple[int, float, float]]:
     """Return ``(step_idx, s_i, s_next)`` transitions from ``scales`` and ``delta``.
@@ -335,6 +355,17 @@ def _resolve_transitions(
     reference case spends coarse, which tracks the preset and ``delta``. Without
     it such a run gives 33/40 coarse, and at 3072x3072 the transition never
     fires at all and the output stays half-resolution.
+
+    ``sigma_divisor`` is applied last, after adaptive pinning, to every
+    resolved ``t_star`` alike -- a backend-level correction rather than a
+    per-preset one. It exists for Forge Neo's ``neo_shift`` mode, where the
+    model runs at a schedule shift that does not track resolution (see the
+    ``_PRESETS`` comment block), so the shared sigma anchor lands more
+    conservatively there than on a backend that does shift. ``1.0`` is an
+    exact no-op -- dividing by 1.0 changes nothing, so this is mathematically
+    identical to plain ``delta_optimal``. Values above 1.0 lower the
+    threshold (transition later, more coarse steps, more speed); values below
+    1.0 raise it (transition earlier, fewer coarse steps, more conservative).
     """
     if len(scales) < 2:
         return []
@@ -356,6 +387,15 @@ def _resolve_transitions(
                 f"(delta {delta:g} -> {eq:.6g} equivalent at this resolution)"
             )
         t_stars = pinned
+
+    if sigma_divisor != 1.0:
+        divided = [t / sigma_divisor for t in t_stars]
+        if log_fn is not None:
+            log_fn(
+                f"neo_shift: dividing sigma* by {sigma_divisor:g} "
+                f"({', '.join(f'{a:.4f}->{b:.4f}' for a, b in zip(t_stars, divided))})"
+            )
+        t_stars = divided
 
     n_transitions = len(scales) - 1
     out: List[Tuple[int, float, float]] = []
@@ -451,6 +491,7 @@ def sample_speed_core(
     adaptive_delta: bool = False,
     ref_latent: int = REFERENCE_LATENT,
     ref_shift: float = None,
+    sigma_divisor: float = 1.0,
     sampler_kwargs: dict = None,
     full_res_sampler_kwargs: dict = None,
     log_fn: Callable[[str], None] = None,
@@ -468,6 +509,11 @@ def sample_speed_core(
     the canvas; see ``_resolve_transitions``. It only applies to
     ``delta_optimal`` mode -- ``manual`` thresholds are explicit sigmas and are
     already resolution-independent.
+
+    ``sigma_divisor`` (default ``1.0``, an exact no-op) also only applies to
+    ``delta_optimal`` mode; see ``_resolve_transitions`` for what it does and
+    why. Callers that never pass it get identical behaviour to before it
+    existed.
     """
     extra_args = {} if extra_args is None else extra_args
     sampler_kwargs = dict(sampler_kwargs or {})
@@ -485,7 +531,7 @@ def sample_speed_core(
         transitions = _resolve_transitions(
             sigmas, scales, delta, spectrum_A, spectrum_beta, H_full, W_full,
             adaptive=adaptive_delta, ref_latent=ref_latent, ref_shift=ref_shift,
-            log_fn=log_fn,
+            sigma_divisor=sigma_divisor, log_fn=log_fn,
         )
     elif mode == "manual":
         transitions = _resolve_manual(sigmas, scales, manual_sigmas or [])

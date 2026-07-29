@@ -42,6 +42,7 @@ Notes for the webui version:
 - The `dwt` transform needs the optional `PyWavelets` package (`pip install PyWavelets` into the webui venv); `dct` (default) and `fft` have no extra dependencies.
 - If a transition threshold is never reached (too few steps / too small `delta`), the console warns and the output stays at the coarse resolution — increase steps or `delta`.
 - Settings are recorded in the image infotext under the `SPEED:` key.
+- The webui's **Mode** dropdown has a third option, `neo_shift` (default), not present in the ComfyUI node or the SwarmUI extension — see [neo_shift mode](#neo_shift-mode-forge-neo-only).
 
 ## Usage (SwarmUI)
 
@@ -169,6 +170,23 @@ Turn it off to reproduce pre-adaptive behaviour exactly. `delta` keeps its meani
 Set `mode=manual` and supply comma-separated sigma thresholds in `manual_sigmas` (one per transition between adjacent scales). Sigma decreases as denoising progresses, so the first threshold should be larger than the last (e.g. `0.95,0.85` for three scales).
 
 Because the quality boundary is a sigma, manual mode is the most direct expression of it: `manual_sigmas=0.968` reproduces what `flux`/`flux2` do at any resolution, on any schedule, with no preset or adaptive logic involved. Useful for calibrating a model that has no preset yet — sweep the threshold, find where your hardest detail (small text is a good probe) starts to fail, and back off from there.
+
+### neo_shift mode (Forge Neo only)
+
+The measured sigma anchor (`0.9680`) was calibrated where the effective schedule shift grows with resolution — ComfyUI's `ModelSamplingFlux` and SwarmUI's Sigma Shift both derive `mu` from `width*height`. Forge Neo (`sd-webui-forge-classic`) does not: Flux and FLUX.2 run at a flat `mu=1.15` there regardless of canvas size, and neither model exposes a user-facing Shift slider to change that (unlike Krea 2 / Z-Image, which do). On that flatter schedule the same sigma threshold crosses much earlier in step-count terms, so `delta_optimal`'s shared anchor is safely inside the quality boundary on Forge Neo but leaves real speedup on the table.
+
+A live binary search on Forge Neo (Euler/Beta, seed 42, 1024x1024, `scales=0.5,1.0`) found the true quality floor for `flux` there is sigma ≈ 0.9249, not 0.968 — and reproduced that same floor at both 20 and 40 total steps once the schedule (shift + spacing) was held fixed, confirming sigma is still the invariant *within one schedule family*, just not portable across a schedule-shift change:
+
+| sigma at transition | result |
+|---|---|
+| ≥ 0.9249 | perfect |
+| 0.85 – 0.91 | correct text, fonts distorted |
+| 0.78 – 0.83 | readable, one wrong letter |
+| ≤ 0.67 | unreadable |
+
+`neo_shift` is `delta_optimal` plus one more number, **Sigma divisor**: every resolved `t_star` (after adaptive-delta pinning, if on) is divided by it before the step lookup. `1.0` is an exact no-op — mathematically identical to `delta_optimal`, not just approximately — and the default, `1.03`, lowers the reference-case threshold to `0.9680 / 1.03 = 0.9398`, above the measured 0.9249 floor with a margin favoring quality over speed. It applies uniformly to every preset and every transition; unlike the calibrated sigma\* figures, this is a per-*backend* correction the user supplies, not a per-model constant, so there's no reason to restrict it to `flux`/`flux2` — dial it back to `1.0` for any preset/scene where it doesn't hold.
+
+This only exists in the Forge Neo script (`scripts/speed_forge.py`); the shared `speed_core.py` gained one backward-compatible parameter (`sigma_divisor`, default `1.0`) to support it, and neither the ComfyUI node nor the SwarmUI extension expose it or are affected.
 
 ## Credits & license
 
