@@ -46,6 +46,15 @@ public class SPEEDSamplerExtension : Extension
     /// <summary>Scheduler names that comfy's stock BasicScheduler node accepts (Swarm-custom schedulers like 'align_your_steps' or 'flux2' are computed inside SwarmKSampler and can't be rebuilt from stock nodes).</summary>
     public static HashSet<string> BasicSchedulers = ["normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform", "beta", "linear_quadratic", "kl_optimal"];
 
+    /// <summary>Guards against double-init. The "install" button in the SwarmUI UI clones this same repo into
+    /// BuiltinExtensions/ComfyUIBackend/DLNodes/ComfyUI-SPEED/ to supply the comfy-side node - that's required (the node
+    /// pack must match this extension's repo). But SwarmUI.csproj's default compile glob only excludes Extensions/**, not
+    /// BuiltinExtensions/**/DLNodes/**, so that clone's copy of this .cs file also gets compiled into the core SwarmUI
+    /// assembly, producing a second SPEEDSamplerExtension instance whose OnInit() runs alongside the real one loaded from
+    /// Extensions/ComfyUI-SPEED/. Without this guard the second run throws (duplicate T2IParamTypes.Register key) and
+    /// crashes Swarm's startup entirely.</summary>
+    private static bool Initialized = false;
+
     public override void PopulateMetadata()
     {
         base.PopulateMetadata();
@@ -57,6 +66,12 @@ public class SPEEDSamplerExtension : Extension
     public override void OnInit()
     {
         InstallableFeatures.RegisterInstallableFeature(new("SPEED Sampler", FeatureId, RepoUrl, "aoleg", $"This will install the ComfyUI-SPEED node pack from {RepoUrl} (MIT License, derived from ruwwww's ComfyUI-SPEED and from the official SPEED code by Howard Xiao et al, BSD-3-Clause).\nThis must be the same repo this extension came from - the model presets and adaptive-delta options it sends need the matching node version.\nDo you wish to install?"));
+        if (Initialized)
+        {
+            Logs.Debug("[SPEED] SPEEDSamplerExtension.OnInit() ran again (duplicate copy compiled from BuiltinExtensions/ComfyUIBackend/DLNodes/ComfyUI-SPEED/); skipping duplicate param/script registration.");
+            return;
+        }
+        Initialized = true;
         ScriptFiles.Add("assets/speed_install.js");
         ScriptFiles.Add("assets/speed_ui.js");
         ComfyUIBackendExtension.NodeToFeatureMap["SamplerSPEED"] = FeatureId;
