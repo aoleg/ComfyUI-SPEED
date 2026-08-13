@@ -99,6 +99,36 @@ class _ShapeSafeRandn:
                            dtype=torch.float32).to(device=x.device, dtype=x.dtype)
 
 
+def _anima_reference_latents_active(p) -> bool:
+    """True when Anima will concatenate reference latents onto ``x`` mid-sampling.
+
+    Anima's ``forward`` (``backend/nn/anima.py``) does
+    ``torch.cat((x, ref), dim=2)`` -- the *temporal* axis -- so every reference
+    has to match ``x`` spatially. A SPEED coarse segment runs ``x`` at a
+    fraction of the full latent size while the stored references stay at full
+    size, and the cat raises. That covers Anima Edit and img2img referencing,
+    both gated behind the ``anima_do_reference`` setting.
+
+    Detected from the runtime list rather than the setting alone, so a run that
+    happens to carry no references still gets SPEED. ``dynamic_args.ref_latents``
+    is rewritten on every positive-prompt conditioning pass (cleared when the
+    setting is off), which happens before ``process_before_every_sampling``, so
+    it cannot go stale between runs.
+
+    Scoped to Anima on purpose: Flux/Krea/Qwen populate the same list but
+    consume it differently, and those paths are not what this guard was written
+    against.
+    """
+    model = getattr(p, "sd_model", None)
+    if model is None or type(model).__name__ != "Anima":
+        return False
+    try:
+        from backend.args import dynamic_args
+    except ImportError:
+        return False
+    return bool(getattr(dynamic_args, "ref_latents", None))
+
+
 def _make_speed_func(base_fn, cfg: dict):
     """Wrap a k-diffusion ``sample_*`` function with SPEED segmentation."""
 
@@ -196,8 +226,9 @@ class SpeedForgeScript(scripts.Script):
                     info="Power-spectrum fit used by delta_optimal mode. krea-2 = few-step "
                          "Krea 2 (Turbo, or base + Turbo LoRA); krea-2-raw = base model at "
                          "40-50 steps with CFG; z-image = Z-Image Turbo; flux2 = FLUX.2 at "
-                         "40-50 steps. flux/flux2 are calibrated from measured output; "
-                         "the rest are spectrum-derived and untested.",
+                         "40-50 steps; anima = Anima at its 32-step preset. flux/flux2 are "
+                         "calibrated from measured output; the rest are spectrum-derived "
+                         "and untested.",
                 )
                 # Persisted normally (no do_not_save_to_config): a preset this
                 # extension no longer offers doesn't need special-casing here.
@@ -347,6 +378,14 @@ class SpeedForgeScript(scripts.Script):
         if getattr(p, "mask", None) is not None or getattr(p.sd_model, "is_inpaint", False):
             _log("inpainting detected; SPEED skipped (masks/image conditioning "
                  "are tied to the full latent resolution).")
+            return
+
+        if _anima_reference_latents_active(p):
+            _log("Anima reference latents detected (Anima Edit / img2img "
+                 "referencing); SPEED skipped -- the references are concatenated "
+                 "onto the latent and are tied to its full resolution. Turn off "
+                 "'anima_do_reference' in Settings > Stable Diffusion to use "
+                 "SPEED on this model.")
             return
 
         sampler = getattr(p, "sampler", None)

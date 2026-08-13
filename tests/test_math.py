@@ -115,7 +115,15 @@ class TestPresets(unittest.TestCase):
         "krea-2-raw": 0.8300,
         "z-image": 0.9400,
         "flux2": 0.9680,       # measured
+        "anima": 0.9600,
     }
+
+    # Forge Neo's live binary search floor (measured on Flux.1, but the schedule
+    # family is what carries over -- see speed_core.py's `sigma_divisor` note).
+    NEO_QUALITY_FLOOR = 0.9249
+
+    # The webui's default Sigma divisor in `neo_shift` mode.
+    NEO_DEFAULT_DIVISOR = 1.03
 
     # The sigma anchor both measured presets share. Everything at or above this
     # passed A/B on two models, two resolutions and two schedules; 0.9389 is the
@@ -130,6 +138,7 @@ class TestPresets(unittest.TestCase):
         "krea-2": 0.2598,
         "krea-2-raw": 0.3928,
         "z-image": 0.1607,
+        "anima": 0.1111,
     }
 
     def _sigma_star(self, preset, scale=0.5, delta=0.01, latent=None):
@@ -156,6 +165,11 @@ class TestPresets(unittest.TestCase):
                          _speed_core._PRESETS["wan21"]["beta"])
         self.assertEqual(_speed_core._PRESETS["z-image"]["beta"],
                          _speed_core._PRESETS["flux"]["beta"])
+        # Anima encodes with AutoencoderKLQwenImage, whose latents_mean /
+        # latents_std are byte-identical to Wan 2.1's -- the same match krea-2
+        # relies on, so the same slope.
+        self.assertEqual(_speed_core._PRESETS["anima"]["beta"],
+                         _speed_core._PRESETS["wan21"]["beta"])
 
     def test_raw_preset_transitions_later_than_the_few_step_one(self):
         self.assertLess(self._sigma_star(_speed_core._PRESETS["krea-2-raw"]),
@@ -174,9 +188,20 @@ class TestPresets(unittest.TestCase):
         # 1024px image is 64x64, not 128x128. Its sigma* is therefore
         # calibrated at omega_max 32, not 64.
         self.assertEqual(_speed_core._PRESETS["flux2"]["ref_latent"], 64)
-        for name in ("flux", "wan21", "krea-2", "krea-2-raw", "z-image"):
+        for name in ("flux", "wan21", "krea-2", "krea-2-raw", "z-image", "anima"):
             with self.subTest(preset=name):
                 self.assertEqual(_speed_core._PRESETS[name]["ref_latent"], 128)
+
+    def test_anima_reference_latent_is_not_halved_by_its_patch_size(self):
+        # Anima's DiT also uses patch_spatial=2, but it applies that packing
+        # inside x_embedder -- downstream of the sampler -- so SPEED still sees
+        # a 128x128 grid at 1024x1024. FLUX.2 packs in the *latent format*, so
+        # its sampler-visible grid really is halved. Same patch size, opposite
+        # answer; this pins which side of the sampler each one lands on.
+        self.assertEqual(_speed_core._PRESETS["anima"]["ref_latent"],
+                         _speed_core.REFERENCE_LATENT)
+        self.assertNotEqual(_speed_core._PRESETS["anima"]["ref_latent"],
+                            _speed_core._PRESETS["flux2"]["ref_latent"])
 
     def test_flux2_sigma_star_holds_at_its_own_geometry(self):
         # Guards the recalibration: assuming the 8x geometry (a 128 latent at
@@ -206,9 +231,29 @@ class TestPresets(unittest.TestCase):
         for name in ("flux", "flux2"):
             with self.subTest(preset=name):
                 self.assertNotIn("ref_shift", _speed_core._PRESETS[name])
-        for name in ("wan21", "krea-2", "krea-2-raw", "z-image"):
+        for name in ("wan21", "krea-2", "krea-2-raw", "z-image", "anima"):
             with self.subTest(preset=name):
                 self.assertIn("ref_shift", _speed_core._PRESETS[name])
+
+    def test_anima_ref_shift_is_a_raw_multiplier(self):
+        # Anima is a PredictionDiscreteFlow model (time_snr_shift), so its
+        # ref_shift takes the z-image / wan21 units -- the raw multiplier, not
+        # the exp(mu) the PredictionFlux presets use. Its scheduler config
+        # declares shift 3.0 with use_dynamic_shifting off, so this is flat at
+        # every resolution. Mixing the units up is knowledge_sigmas.md 5.4.
+        self.assertEqual(_speed_core._PRESETS["anima"]["ref_shift"],
+                         _speed_core._PRESETS["z-image"]["ref_shift"])
+        self.assertNotEqual(_speed_core._PRESETS["anima"]["ref_shift"],
+                            _speed_core._PRESETS["krea-2"]["ref_shift"])
+
+    def test_anima_clears_the_neo_floor_on_the_default_forge_path(self):
+        # The reason anima targets 0.9600 rather than a value picked from its
+        # step budget alone: Forge Neo defaults to neo_shift with a 1.03
+        # divisor, so the threshold that actually gets used is sigma*/1.03, and
+        # that is what has to clear the measured floor -- not sigma* itself.
+        sigma_star = self._sigma_star(_speed_core._PRESETS["anima"])
+        self.assertGreater(sigma_star / self.NEO_DEFAULT_DIVISOR,
+                           self.NEO_QUALITY_FLOOR)
 
     def test_measured_presets_share_the_sigma_anchor(self):
         # The quality boundary is a sigma and it transferred across models, so

@@ -52,6 +52,7 @@ from .spectral_utils import (
 #   krea-2-raw   Wan 2.1 / Qwen-Image  0.8300         spectrum-derived, untested
 #   z-image      Flux VAE              0.9400         spectrum-derived, untested
 #   flux2        Flux VAE (borrowed)   0.9680         measured (ref latent 64)
+#   anima        Wan 2.1 / Qwen-Image  0.9600         spectrum-derived, untested
 #
 # ``flux`` and ``flux2`` are calibrated from A/B output, and **``flux`` no
 # longer ships the published fit** (A 203.615097, beta 1.915461, sigma* 0.8527
@@ -125,6 +126,72 @@ from .spectral_utils import (
 # steps even sigma* 0.90 -- deliberately the least aggressive target in this
 # table -- lands the transition close to the schedule's midpoint.
 #
+# ``anima`` (circlestone-labs/Anima) is a Cosmos-Predict2-class DiT --
+# ``CosmosTransformer3DModel``, 28 blocks at 2048 channels, ``patch_spatial=2``
+# -- re-textencoded onto Qwen3-0.6B. Its three numbers are better founded than
+# ``flux2``'s, all read from the shipped config rather than inferred from
+# lineage:
+#
+#   * ``beta`` is the Wan 2.1 fit, on the same basis as ``krea-2`` but confirmed
+#     directly: the VAE is ``AutoencoderKLQwenImage`` (``z_dim`` 16,
+#     ``dim_mult [1,2,4,4]`` -> 8x spatial) and its ``latents_mean`` /
+#     ``latents_std`` are byte-identical to Wan 2.1's.
+#   * ``ref_latent`` is 128, *not* 64, despite ``patch_spatial=2``. Anima's 2x2
+#     packing happens inside the DiT's ``x_embedder``, downstream of the
+#     sampler, so SPEED still sees a 128x128 grid at 1024x1024. FLUX.2 is the
+#     opposite case -- there the packing is in the latent format itself, so the
+#     sampler-visible grid really is halved. Same patch size, different answer;
+#     what matters is which side of the sampler it happens on.
+#   * ``ref_shift`` is 3.0 as a **raw multiplier**, not ``exp(mu)``. Anima is a
+#     ``PredictionDiscreteFlow`` model (``time_snr_shift``), so it takes the
+#     ``z-image`` / ``wan21`` units, not the ``flux`` / ``krea-2`` ones. See
+#     knowledge_sigmas.md 5.4.
+#
+# sigma* 0.9600 is picked from where the Forge Neo default path lands rather
+# than from the step budget alone. Anima's Forge Neo preset is 32 steps, Beta,
+# ER SDE, CFG 4.0 at shift 3.0, and the webui defaults to ``neo_shift`` with a
+# 1.03 divisor -- so the threshold that actually gets used is 0.9600/1.03 =
+# 0.9320, clearing the 0.9249 quality floor the live binary search found on this
+# backend (see ``sigma_divisor`` below) with margin. Ship it at 1.0 divisor and
+# it is more conservative still. Untested on Anima itself: 0.9249 was measured
+# on Flux.1, and only the *schedule family* carries over, not the model.
+#
+# Two things follow from Anima declaring ``use_dynamic_shifting: false``, which
+# no other preset here does. First, its schedule shift is flat on **every**
+# backend, not just Forge Neo -- so the payoff does not grow with canvas size
+# the way ``flux``'s does (~1.15x at 1024 to ~1.9x at 1536); expect roughly the
+# same ratio at every resolution with adaptive delta on. Second, the
+# step-fraction cap has no schedule compression left to compensate for, so its
+# only effect here is to trim: ``reference_coarse_fraction`` inverts a
+# *uniform-in-t* schedule, Anima's default scheduler is Beta(0.6,0.6) which
+# clusters steps at both ends of the range, and at 32 steps the cap holds the
+# transition about 3 steps earlier than the threshold's own crossing. That
+# divergence is not new -- it costs krea-2 one step at 20 and krea-2-raw one to
+# two at 40-50 -- but Anima is the first spectrum-derived preset with a large
+# default step budget, so it is the first place the gap is worth naming. If A/B
+# shows the threshold is right and the cap is what is costing speed, the fix is
+# to promote the preset to measured and drop ``ref_shift`` (checklist step 3 in
+# knowledge_speed.md 10), not to loosen the cap for everyone.
+#
+# Verified against a synthetic Forge Neo schedule (the method in
+# knowledge_speed.md 6: PredictionDiscreteFlow sigma table at shift 3.0, Beta
+# (0.6,0.6) spacing, ``scales=0.5,1.0``, divisor 1.03, adaptive on):
+#
+#   preset  1024px      1536px      transition sigma   approx speedup
+#   flux     8/32 coarse  8/32 coarse  0.9335           1.23x
+#   anima    6/32 coarse  6/32 coarse  0.9600           1.16x
+#
+# Two things to read off that. First, both are flat across resolution, which is
+# the ``use_dynamic_shifting: false`` consequence above showing up in practice
+# -- do not expect the README's 1.15x->1.9x curve here. Second, **this preset is
+# currently slower than running Anima on ``flux``**, which is what it replaces.
+# That is entirely the cap: with adaptive off, ``anima`` gives 9/32 at 1024px
+# against ``flux``'s 8/32, so the threshold really is the more aggressive of the
+# two, and the cap then drags it back to 6. Shipping conservative is the right
+# default for an untested preset, but if A/B clears sigma 0.9182 (the 9/32
+# crossing) then dropping ``ref_shift`` is the change that pays -- it also
+# restores resolution scaling, 11/32 at 1536px and 13/32 at 2048px.
+#
 # ``delta`` remains the speed/quality slider on top of a preset. For ``krea-2``
 # it spans sigma* 0.93 (delta=0.005) to 0.80 (delta=0.05); smaller delta means
 # an earlier transition, higher quality and less speedup.
@@ -195,6 +262,7 @@ _PRESETS = {
     "krea-2-raw": {"A": 887.402358, "beta": 2.422687, "ref_latent": 128, "ref_shift": 3.158193},
     "z-image":    {"A": 877.001476, "beta": 1.915461, "ref_latent": 128, "ref_shift": 3.0},
     "flux2":      {"A": 520.495848, "beta": 1.915461, "ref_latent": 64},
+    "anima":      {"A": 8664.998524, "beta": 2.422687, "ref_latent": 128, "ref_shift": 3.0},
     "custom": None,
 }
 

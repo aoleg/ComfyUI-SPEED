@@ -7,6 +7,7 @@ without a running Forge instance.
 Run from the repo root with:
   python -m unittest tests.test_forge_script -v
 """
+import contextlib
 import importlib.util as _iu
 import pathlib
 import sys
@@ -123,6 +124,42 @@ class FakeFullResHijack:
         return torch.zeros(self.full_shape)
 
 
+class _FakeAnimaModel:
+    """Stands in for Forge's Anima diffusion engine.
+
+    The guard identifies the model by class name, which is what the real engine
+    (``backend/diffusion_engine/anima.py``) exposes without importing it.
+    """
+    is_inpaint = False
+
+
+_FakeAnimaModel.__name__ = "Anima"
+
+
+@contextlib.contextmanager
+def _fake_backend_args(ref_latents):
+    """Install a stub ``backend.args`` exposing ``dynamic_args.ref_latents``.
+
+    Installed per-test rather than globally so the default path still exercises
+    the ImportError branch (no Forge backend present).
+    """
+    args_stub = types.ModuleType("backend.args")
+    args_stub.dynamic_args = SimpleNamespace(ref_latents=list(ref_latents))
+    backend_stub = types.ModuleType("backend")
+    backend_stub.args = args_stub
+    saved = {k: sys.modules.get(k) for k in ("backend", "backend.args")}
+    sys.modules["backend"] = backend_stub
+    sys.modules["backend.args"] = args_stub
+    try:
+        yield args_stub
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+
 def make_p(sampler_func, is_hr_pass=False, mask=None, is_inpaint=False):
     return SimpleNamespace(
         sampler=SimpleNamespace(func=sampler_func),
@@ -135,8 +172,9 @@ def make_p(sampler_func, is_hr_pass=False, mask=None, is_inpaint=False):
 
 UI_DEFAULTS = dict(transform="dct", mode="manual", model_preset="flux",
                    scales="0.5,1.0", adaptive_delta=True, delta=0.01,
-                   manual_sigmas="0.72", spectrum_A=203.615097,
-                   spectrum_beta=1.915461, seed=-1, apply_hr=False)
+                   sigma_divisor=1.03, manual_sigmas="0.72",
+                   spectrum_A=203.615097, spectrum_beta=1.915461, seed=-1,
+                   apply_hr=False)
 
 
 def run_hooks(p, enabled=True, seeds=(123,), **overrides):
@@ -145,9 +183,9 @@ def run_hooks(p, enabled=True, seeds=(123,), **overrides):
     script = speed_forge.SpeedForgeScript()
     script.before_process_batch(
         p, enabled, ui["transform"], ui["mode"], ui["model_preset"],
-        ui["scales"], ui["adaptive_delta"], ui["delta"], ui["manual_sigmas"],
-        ui["spectrum_A"], ui["spectrum_beta"], ui["seed"], ui["apply_hr"],
-        seeds=list(seeds), prompts=["test"], subseeds=[0])
+        ui["scales"], ui["adaptive_delta"], ui["delta"], ui["sigma_divisor"],
+        ui["manual_sigmas"], ui["spectrum_A"], ui["spectrum_beta"], ui["seed"],
+        ui["apply_hr"], seeds=list(seeds), prompts=["test"], subseeds=[0])
     script.process_before_every_sampling(p)
     return script
 
@@ -296,6 +334,34 @@ class TestScriptHooks(ForgeScriptTestCase):
         p = make_p(fake, mask=torch.ones(1))
         run_hooks(p)
         self.assertIs(p.sampler.func, fake)
+
+    def test_anima_reference_latents_skipped(self):
+        # Anima concatenates its reference latents onto x along the temporal
+        # axis, which requires them to match x spatially -- a coarse segment
+        # breaks that. The guard keys off the runtime list, not the setting.
+        fake = RecordingSampler()
+        p = make_p(fake)
+        p.sd_model = _FakeAnimaModel()
+        with _fake_backend_args(ref_latents=[torch.zeros(1, 16, 1, 128, 128)]):
+            run_hooks(p)
+        self.assertIs(p.sampler.func, fake)
+
+    def test_anima_without_references_still_wrapped(self):
+        # Anima Edit turned off (or simply no references on this run) is the
+        # ordinary case and must not lose SPEED.
+        p = make_p(RecordingSampler())
+        p.sd_model = _FakeAnimaModel()
+        with _fake_backend_args(ref_latents=[]):
+            run_hooks(p)
+        self.assertTrue(getattr(p.sampler.func, "_speed_wrapped", False))
+
+    def test_reference_latents_on_other_models_not_skipped(self):
+        # Flux/Krea/Qwen populate the same list but consume it differently;
+        # the guard is deliberately scoped to Anima.
+        p = make_p(RecordingSampler())
+        with _fake_backend_args(ref_latents=[torch.zeros(1, 16, 1, 128, 128)]):
+            run_hooks(p)
+        self.assertTrue(getattr(p.sampler.func, "_speed_wrapped", False))
 
     def test_hr_pass_gated_by_checkbox(self):
         fake = RecordingSampler()
