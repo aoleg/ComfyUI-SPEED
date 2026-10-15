@@ -13,6 +13,12 @@ sampler function (the math is shared with the ComfyUI node via
 
 Designed for flow-matching models (Flux, Wan, ...) whose sigmas live in
 (0, 1]; eps-prediction models (SD1.x/SDXL) run but are unvalidated.
+
+The "RAW composition stage" subsection (Forge Neo only, see
+docs/krea2-hybrid-plan.md) passes a ``segment_hook`` into the shared core:
+coarse segments get the encoded negative prompt, a real CFG scale and the
+step density of a RAW reference schedule; fine segments get Forge's own
+``extra_args`` untouched.
 """
 from __future__ import annotations
 
@@ -20,12 +26,14 @@ import functools
 import importlib.util
 import os
 import sys
+import time
 import types
+import uuid
 
 import gradio as gr
 import torch
 
-from modules import errors, scripts
+from modules import errors, script_callbacks, scripts
 from modules.ui_components import InputAccordion
 
 EXT_ROOT = scripts.basedir()
@@ -68,6 +76,30 @@ def _load_speed_core():
 
 
 speed_core = _load_speed_core()
+
+
+def _load_cfg_unlock():
+    """Load ``scripts/lib_speed_forge/cfg_unlock.py`` once per process. Forge
+    only runs the files directly in ``scripts/``, and a UI reload re-runs this
+    script without restarting Python: reusing the module keeps its per-tab
+    flags and the record of what it substituted in ``modules.ui``."""
+    name = "comfyui_speed_forge_cfg_unlock"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(
+        name, os.path.join(EXT_ROOT, "scripts", "lib_speed_forge", "cfg_unlock.py"))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+cfg_unlock = _load_cfg_unlock()
+cfg_unlock.register()
 
 
 class _ShapeSafeRandn:
@@ -129,6 +161,617 @@ def _anima_reference_latents_active(p) -> bool:
     return bool(getattr(dynamic_args, "ref_latents", None))
 
 
+# =============================================================================
+# RAW composition stage ("diversity" subsection)
+# =============================================================================
+
+# Model class name -> experimental. Krea 2 is the tested target; Z-Image and
+# FLUX.2 Klein have community Turbo LoRAs and run uncalibrated.
+DIVERSITY_MODELS = {"Krea2": False, "ZImage": True, "Flux2": True}
+
+# Step count of the RAW reference schedule whose part above the transition
+# sigma the coarse segments run (28 = diffusers' Krea 2 default). Fixed, not a
+# setting: in live tests on Krea 2 every denser reference (36, 44, 52)
+# distorted small faces in wide shots (waxy skin, uneven eyes, smeared
+# mouths) at RAW CFG 3.5 and 4.5 and with 9 Turbo steps, while 28 stayed clean.
+RAW_REFERENCE_STEPS = 28
+
+# Tolerance for "this sigma is on the reference schedule". Schedules are float32.
+_SIGMA_TOL = 1e-4
+
+
+def _parse_patterns(text) -> tuple:
+    """Comma-separated, case-insensitive filename substrings."""
+    return tuple(t.strip().lower() for t in str(text or "").split(",") if t.strip())
+
+
+# --- Turbo LoRA: switching it per segment ------------------------------------
+#
+# Forge bakes prompt LoRAs into the weights at extra_networks.activate through
+# networks.load_lora_for_models. The loader is intercepted (the way Neo-LoraCtl
+# does it) so the patches of the files matching the Turbo pattern can be
+# adopted; every other LoRA reaches the stock loader with its original
+# arguments. Two ways to switch the adopted LoRA:
+#
+# * bake (default): the load is left exactly as Forge does it, and the switch
+#   rewrites the Turbo-patched weights from the patcher's backups twice per
+#   pass, off before the coarse segments and back on before the first fine
+#   one. Native speed in both stages; the fine stage runs on the same weights
+#   a plain baked run uses. The rewrite mirrors Forge's patch_weight_to_device
+#   (Neo-LoraCtl's _rebake_keys, which its Seed Variance section runs live).
+# * online: the matching files are loaded with online_mode=True, so each patch
+#   becomes an OnlineLoRAPatch re-applied on every module forward from its
+#   mutable payload, and writing ``obj.patch[0][0]`` changes the next call
+#   (what Forge's own LoRA Control Integrated does). No weight rewrites, but a
+#   weight clone and merge on every model call, which measured about 0.9 s per
+#   call on a 12.8 GB int8 Krea 2 checkpoint.
+
+_original_load_lora_for_models = None
+
+# [strength, adapter, strength_model, offset, function] (backend/patcher/base.py)
+_PATCH_PAYLOAD_LEN = 5
+
+
+def _lora_matches(filename, patterns) -> bool:
+    base = os.path.splitext(os.path.basename(str(filename)))[0].lower()
+    return any(pat in base for pat in patterns)
+
+
+def _lora_label(filename) -> str:
+    return os.path.splitext(os.path.basename(str(filename)))[0]
+
+
+def _null_lora_hash(p):
+    """Make the stock loader rebuild prompt LoRAs on the next activation."""
+    models = [getattr(p, "sd_model", None)]
+    try:
+        from modules import shared
+        models.append(getattr(shared, "sd_model", None))
+    except ImportError:
+        pass
+    for model in models:
+        if model is not None and hasattr(model, "current_lora_hash"):
+            model.current_lora_hash = None
+
+
+def _install_lora_interception() -> bool:
+    global _original_load_lora_for_models
+    if _original_load_lora_for_models is not None:
+        return True
+    try:
+        import networks
+    except ImportError:
+        _log("diversity: Forge's builtin LoRA module ('networks') is not importable; "
+             "the RAW composition stage cannot switch the Turbo LoRA.")
+        return False
+    _original_load_lora_for_models = networks.load_lora_for_models
+    networks.load_lora_for_models = _intercepted_load_lora_for_models
+    return True
+
+
+def _payload_error(entry) -> str | None:
+    if not isinstance(entry, (tuple, list)) or len(entry) != _PATCH_PAYLOAD_LEN:
+        got = len(entry) if isinstance(entry, (tuple, list)) else type(entry).__name__
+        return f"patch payload arity mismatch: expected {_PATCH_PAYLOAD_LEN}, got {got}"
+    if not isinstance(entry[0], (int, float)) or isinstance(entry[0], bool):
+        return f"patch strength is not a number: {type(entry[0]).__name__}"
+    return None
+
+
+def _validate_patch_object(obj) -> str | None:
+    """Error string if ``obj`` does not look like the OnlineLoRAPatch this was
+    written against (same check as Neo-LoraCtl's), else None."""
+    patch = getattr(obj, "patch", None)
+    if not isinstance(patch, list) or len(patch) < 1:
+        return f"patch object has no 1+-element .patch list: {type(obj).__name__}"
+    err = _payload_error(patch[0])
+    if err is not None:
+        return err
+    if not callable(obj):
+        return f"patch object is not callable: {type(obj).__name__}"
+    return None
+
+
+def _set_payload_strength(container: list, index: int, strength: float):
+    entry = container[index]
+    if isinstance(entry, list):
+        entry[0] = strength
+    else:
+        container[index] = (strength,) + tuple(entry[1:])
+
+
+def _set_turbo_strength(entries, scale: float):
+    """Write ``base * scale`` into every adopted online Turbo payload."""
+    for obj, base, _label in entries:
+        _set_payload_strength(obj.patch, 0, base * scale)
+
+
+def _locate_baked(patches: dict, key: str, adapter):
+    """``(list, index)`` of a baked payload in one patcher's ``patches``, found
+    by adapter identity: clones copy the per-key lists but share the payloads'
+    adapter objects, and a strength write may replace the payload itself."""
+    plist = patches.get(key) if patches else None
+    if not plist:
+        return None
+    for i, entry in enumerate(plist):
+        if (isinstance(entry, (tuple, list)) and len(entry) == _PATCH_PAYLOAD_LEN
+                and entry[1] is adapter):
+            return plist, i
+    return None
+
+
+def _live_baked(entries, unet):
+    patches = getattr(unet, "patches", None)
+    return [e for e in entries if _locate_baked(patches, e[0], e[1]) is not None]
+
+
+def _rebake_keys(patcher, keys):
+    """Recompute the given keys' live weights from the patcher's pristine
+    backups plus whatever its ``patches`` currently say (Turbo payloads
+    included, at their current strength). Copied from Neo-LoraCtl
+    (scripts/neo_loractl.py), which mirrors Forge's patch_weight_to_device
+    (backend/patcher/base.py) except that it sources from the backup: the
+    live weight is already merged and merging onto it would double-apply.
+
+    A key with no backup is untouched: its patches are applied per forward
+    (lowvram path; partially_unload restores and pops the backup when it
+    moves a module there), so the payload change alone already took effect.
+    Returns the number of keys rewritten."""
+    import torch
+    from backend import memory_management, utils as backend_utils
+    from backend.float import stochastic_rounding
+    from backend.patcher.base import get_key_weight
+    from backend.patcher.lora import merge_lora_to_weight, string_to_seed
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    done = 0
+    for key in keys:
+        bk = patcher.backup.get(key)
+        if bk is None:
+            continue
+        weight, set_func, convert_func = get_key_weight(patcher.model, key)
+        remaining = [p for p in patcher.patches.get(key, []) if p[0] != 0.0]
+        if not remaining:
+            # Pure restore: mimic unpatch_model, the backup is the raw
+            # original (quantized checkpoints included), set it back as-is.
+            restored = bk.weight.to(weight.device, copy=True)
+            if bk.inplace_update:
+                backend_utils.copy_to_param(patcher.model, key, restored)
+            else:
+                backend_utils.set_attr(patcher.model, key, restored)
+            done += 1
+            continue
+        temp_dtype = memory_management.lora_compute_dtype(weight.device)
+        temp = memory_management.cast_to_device(bk.weight, weight.device,
+                                                temp_dtype, copy=True)
+        if convert_func is not None:
+            temp = convert_func(temp, inplace=True)
+        out = merge_lora_to_weight(remaining, temp, key)
+        if set_func is None:
+            out = stochastic_rounding(out, weight.dtype, seed=string_to_seed(key))
+            if bk.inplace_update:
+                backend_utils.copy_to_param(patcher.model, key, out)
+            else:
+                backend_utils.set_attr(patcher.model, key, out)
+        else:
+            set_func(out, inplace_update=bk.inplace_update, seed=string_to_seed(key))
+        done += 1
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return done
+
+
+def _set_baked_strength(unet, entries, scale: float) -> list:
+    """Write ``base * scale`` into the baked Turbo payloads of ``unet``;
+    returns the keys whose weights must be rewritten."""
+    affected = []
+    for key, adapter, base, _label in entries:
+        loc = _locate_baked(unet.patches, key, adapter)
+        if loc is None:
+            continue
+        _set_payload_strength(loc[0], loc[1], base * scale)
+        if key not in affected:
+            affected.append(key)
+    return affected
+
+
+def _switch_baked(unet, entries, scale: float):
+    """Flip the baked Turbo LoRA to ``base * scale`` in place.
+
+    Edits the payloads of the unet that is loaded for sampling (lowvram keys
+    read that patcher's lists per forward) and rewrites the merged weights.
+    patches_uuid is deliberately left alone: a bump would make the next load
+    unpatch and repatch the whole model. If the rewrite fails, the payloads
+    go back to base, a second rewrite is tried, and the uuid is bumped so the
+    next load rebuilds every weight from its backup either way.
+    """
+    started = time.perf_counter()
+    keys = _set_baked_strength(unet, entries, scale)
+    try:
+        n = _rebake_keys(unet, keys)
+    except Exception:
+        _set_baked_strength(unet, entries, 1.0)
+        try:
+            _rebake_keys(unet, keys)
+        finally:
+            unet.patches_uuid = uuid.uuid4()
+        raise
+    return n, len(keys), time.perf_counter() - started
+
+
+# Pinned (page-locked) host memory copies to the GPU at full DMA speed;
+# Forge's backups are plain pageable tensors (``weight.to(offload_device)``,
+# and Forge's own pin_memory only runs with --pin-shared-memory, for
+# Parameters). The off switch is mostly that copy, so the Turbo keys' backups
+# are swapped once for pinned copies. Capped at this share of system RAM:
+# Windows limits page-locked memory to about half of it.
+_PIN_RAM_SHARE = 0.4
+
+
+def _pin_available() -> bool:
+    return torch.cuda.is_available()
+
+
+def _pin_tensor(tensor):
+    return tensor.pin_memory()
+
+
+def _is_pinned(tensor) -> bool:
+    return tensor.is_pinned()
+
+
+def _ram_total() -> int:
+    import psutil
+    return int(psutil.virtual_memory().total)
+
+
+def _pin_backups(patcher, keys):
+    """Swap the CPU backups of ``keys`` for pinned copies, once per backup.
+
+    The backup dict is shared by every clone of the patcher, so this is seen
+    by all of them, and Forge keeps treating the entries as its own: restore
+    and repatch read ``.weight`` as before, and a pinned tensor freed by
+    Forge goes back to PyTorch's pinned-memory cache (emptied by
+    ``_release_pinned`` once no adoption is left). Only plain CPU tensors
+    are pinned, so a quantized tensor subclass is left as it is. Returns
+    ``(pinned, bytes, seconds)``, or None when the budget does not allow it.
+    """
+    if not _pin_available():
+        return 0, 0, 0.0
+    started = time.perf_counter()
+    todo = []
+    for key in keys:
+        bk = patcher.backup.get(key)
+        weight = getattr(bk, "weight", None)
+        if (type(weight) not in (torch.Tensor, torch.nn.Parameter)
+                or weight.device.type != "cpu" or _is_pinned(weight)):
+            continue
+        todo.append((key, bk, weight))
+    if not todo:
+        return 0, 0, 0.0
+    size = sum(w.numel() * w.element_size() for _, _, w in todo)
+    if size > _PIN_RAM_SHARE * _ram_total():
+        return None
+    pinned = 0
+    for key, bk, weight in todo:
+        copy = _pin_tensor(weight)
+        if isinstance(weight, torch.nn.Parameter):
+            copy = torch.nn.Parameter(copy, requires_grad=weight.requires_grad)
+        patcher.backup[key] = bk._replace(weight=copy)
+        pinned += 1
+    return pinned, size, time.perf_counter() - started
+
+
+def _release_pinned():
+    """Hand PyTorch's cached pinned blocks back to the OS once the backups
+    pinned for the Turbo LoRA are gone (a new load or another prompt)."""
+    empty = getattr(torch._C, "_host_emptyCache", None)
+    if empty is not None and _pin_available():
+        try:
+            empty()
+        except Exception:
+            pass
+
+
+def _global_online_lora() -> bool:
+    try:
+        from backend.args import dynamic_args
+    except ImportError:
+        return False
+    return bool(getattr(dynamic_args, "online_lora", False))
+
+
+def _turbo_owner(filename, online_mode) -> str | None:
+    """Why another writer already owns this file's patch strengths, or None.
+
+    Two writers on the same payloads would fight, so the feature stands down
+    rather than share: Forge's builtin LoRA Control (its ``<lora:name:[a:b]>``
+    mapping, keyed by filename), Neo-LoraCtl when its filter schedules this
+    file (its default filter excludes accelerator LoRAs), or any outer
+    interceptor that already asked for online loading while the global
+    on-the-fly option is off.
+    """
+    for data in getattr(scripts, "scripts_data", None) or []:
+        script_class = getattr(data, "script_class", None)
+        name = getattr(script_class, "__name__", "")
+        if name == "LoRAControl" and filename in (getattr(script_class, "mapping", None) or {}):
+            return "Forge's LoRA Control Integrated schedules it (<lora:...:[a:b]> syntax)"
+        if name == "NeoLoraCtlScript" and getattr(script_class, "enabled", False):
+            loractl_core = sys.modules.get("neo_loractl_core")
+            check = getattr(loractl_core, "lora_is_scheduled", None)
+            try:
+                scheduled = check is not None and check(
+                    filename, list(getattr(script_class, "patterns", []) or []),
+                    getattr(script_class, "filter_mode", "exclude"))
+            except Exception:
+                scheduled = False
+            if scheduled:
+                return "Neo-LoraCtl schedules it (its filter includes this file)"
+    if online_mode and not _global_online_lora():
+        return "another extension already loads it on the fly"
+    return None
+
+
+def _intercepted_load_lora_for_models(model, clip, lora, strength_model, strength_clip,
+                                      filename="default", online_mode=False):
+    cls = SpeedForgeScript
+    route = cls.turbo_route
+    if route is not None and not cls.turbo_cycle_open:
+        # First load call of a fresh activation: the stock loader has just
+        # reset forge_objects to the originals, so prior adoptions are stale.
+        cls.turbo_cycle_open = True
+        cls.turbo_entries = []
+        cls.turbo_baked = []
+        cls.turbo_baked_patterns = route[0]
+        cls.turbo_blockers = []
+    if route is None or model is None or not _lora_matches(filename, route[0]):
+        return _original_load_lora_for_models(model, clip, lora, strength_model,
+                                              strength_clip, filename, online_mode)
+
+    label = _lora_label(filename)
+    owner = _turbo_owner(filename, online_mode)
+    if owner is not None:
+        cls.turbo_blockers.append(f"'{label}': {owner}")
+        return _original_load_lora_for_models(model, clip, lora, strength_model,
+                                              strength_clip, filename, online_mode)
+
+    # With the global on-the-fly option on, Forge loads it online whatever we
+    # prefer; drive it that way rather than override the user's setting.
+    online = route[1] == "online" or bool(online_mode)
+    store = "weight_wrapper_patches" if online else "patches"
+    before_store = getattr(model, store, None)
+    before = {k: len(v) for k, v in (before_store or {}).items()}
+    result = _original_load_lora_for_models(model, clip, lora, strength_model,
+                                            strength_clip, filename,
+                                            True if online else online_mode)
+    if result is None:
+        return result
+    after_store = getattr(result[0], store, None)
+    if before_store is None or after_store is None:
+        cls.turbo_blockers.append(f"'{label}': the model has no {store} (Forge API drift?)")
+        return result
+
+    adopted, errors = [], []
+    for key, items in after_store.items():
+        for item in items[before.get(key, 0):]:
+            if online:
+                err = _validate_patch_object(item)
+                if err is None:
+                    adopted.append((item, float(item.patch[0][0]), label))
+            else:
+                err = _payload_error(item)
+                if err is None:
+                    adopted.append((key, item[1], float(item[0]), label))
+            if err is not None:
+                errors.append(f"{key}: {err}")
+    if errors:
+        # The LoRA stays applied at its prompt strength, the same output as a
+        # plain <lora:> tag. The feature stands down.
+        cls.turbo_blockers.append(f"'{label}': refusing to drive its patches (Forge API "
+                                  f"drift?): {errors[0]}"
+                                  + (f" (+{len(errors) - 1} more)" if len(errors) > 1 else ""))
+        return result
+    if not adopted:
+        _log(f"diversity: Turbo LoRA '{label}' added no patches to this model.")
+        return result
+    (cls.turbo_entries if online else cls.turbo_baked).extend(adopted)
+    return result
+
+
+def _redensify(seg_sigmas, reference, anchor):
+    """Replace one coarse segment's sigmas with the reference schedule's.
+
+    ``reference`` is the RAW reference schedule (floats, descending).
+    ``anchor`` is ``None`` for the first coarse segment, whose start must then
+    be on the reference schedule (a txt2img run starts at sigma_max on both);
+    for a later coarse segment it is the previous segment's unpatched end,
+    because this segment starts at SPEED's aligned ``t_tilde``, which is on no
+    schedule. The segment keeps its own first and last sigma; in between go
+    the reference entries strictly inside its bounds.
+
+    Returns ``(sigmas, None)`` or ``(None, reason)``.
+    """
+    first, last = float(seg_sigmas[0]), float(seg_sigmas[-1])
+    if anchor is None:
+        if not any(abs(r - first) <= _SIGMA_TOL for r in reference):
+            return None, (f"segment starts at sigma {first:.4f}, which is not on the "
+                          f"{len(reference) - 1}-step reference schedule (img2img or a "
+                          "mid-schedule start); keeping this segment's own steps")
+        anchor = first
+    upper = min(first, anchor)
+    values = ([first]
+              + [r for r in reference if last + _SIGMA_TOL < r < upper - _SIGMA_TOL]
+              + [last])
+    if len(values) < 2 or any(b >= a for a, b in zip(values, values[1:])):
+        return None, ("reference slice is not strictly decreasing; keeping this "
+                      "segment's own steps")
+    return torch.tensor(values, dtype=seg_sigmas.dtype, device=seg_sigmas.device), None
+
+
+def _make_index_map(orig_len: int, new_len: int):
+    """Map a callback index of the re-densified segment onto the original
+    segment's range, forwarding only the first call per original index, so the
+    progress bar and Forge's step counters see one callback per original step."""
+    last = [-1]
+
+    def index_map(j):
+        i = min(j * orig_len // new_len, orig_len - 1)
+        if i <= last[0]:
+            return None
+        last[0] = i
+        return i
+
+    return index_map
+
+
+def _encode_negative(p):
+    """The unconditional at CFG 1, through the same call ``setup_conds``
+    (modules/processing.py) makes in its CFG > 1 branch, and so through Forge's
+    own ``cached_uc``: a batch encodes once, and the result is the scheduled
+    list ``reconstruct_cond_batch`` indexes by step."""
+    from modules import prompt_parser
+    negative_prompts = prompt_parser.SdConditioning(
+        p.negative_prompts, width=p.width, height=p.height, is_negative_prompt=True,
+        distilled_cfg_scale=p.distilled_cfg_scale)
+    return p.get_conds_with_caching(
+        prompt_parser.get_learned_conditioning, negative_prompts, p.firstpass_steps,
+        [p.cached_uc], p.extra_network_data)
+
+
+def _guidance_overrides_note(p) -> str | None:
+    """Denoiser options that can force the scale back to 1.0 after the wrapper
+    set it (sd_samplers_cfg_denoiser.py): Skip Early CFG and NGMS."""
+    try:
+        from modules.shared import opts
+        skip_early = float(getattr(opts, "skip_early_cond", 0.0) or 0.0)
+    except Exception:
+        skip_early = 0.0
+    ngms = float(getattr(p, "s_min_uncond", 0.0) or 0.0)
+    notes = []
+    if skip_early > 0.0:
+        notes.append(f"Skip Early CFG = {skip_early:g}")
+    if ngms > 0.0:
+        notes.append(f"NGMS = {ngms:g}")
+    if not notes:
+        return None
+    return (" and ".join(notes) + " is set; it can drop the RAW CFG back to 1.0 "
+            "on some coarse steps")
+
+
+def _make_diversity_hook(div: dict, model, schedule_end: float, run: dict):
+    """Build the ``segment_hook`` for one sampling pass.
+
+    ``div`` is the per-pass runtime built in ``process_before_every_sampling``
+    (``uc``, ``cfg``, ``reference``); ``run`` collects what happened, for the
+    restore and the summary in ``_finish_diversity``.
+    """
+    prev_end = [None]
+
+    def hook(seg_index, scale, seg_sigmas, extra_args):
+        coarse = scale < 1.0 - 1e-6
+        if coarse and abs(float(seg_sigmas[-1]) - schedule_end) <= 1e-9:
+            # No transition follows: SPEED is running the rest of the schedule
+            # at reduced resolution. The full-resolution stage this feature
+            # hands off to never comes, so it stands down for the segment.
+            if not run.get("no_transition_logged"):
+                run["no_transition_logged"] = True
+                _log("diversity: no full-resolution segment follows; RAW stage not "
+                     "applied to this pass")
+            _switch_turbo(div, run, 1.0)
+            return seg_sigmas, extra_args, None
+        if not coarse:
+            # Turbo LoRA back at the prompt strength before the first fine call.
+            _switch_turbo(div, run, 1.0)
+            run["fine_segments"] = run.get("fine_segments", 0) + 1
+            return seg_sigmas, extra_args, None
+
+        anchor = prev_end[0]
+        prev_end[0] = float(seg_sigmas[-1])
+        orig_len = len(seg_sigmas) - 1
+        new_sigmas, reason = _redensify(seg_sigmas, div["reference"], anchor)
+        index_map = None
+        if new_sigmas is None:
+            _log(f"diversity: {reason}")
+            new_sigmas = seg_sigmas
+        else:
+            new_len = len(new_sigmas) - 1
+            if new_len != orig_len:
+                index_map = _make_index_map(orig_len, new_len)
+            if new_len < orig_len:
+                _log(f"diversity: the {len(div['reference']) - 1}-step reference is "
+                     f"sparser than this run here ({new_len} vs {orig_len} steps)")
+            _bump_total_steps(model, new_len - orig_len, run)
+        new_len = len(new_sigmas) - 1
+
+        seg_args = dict(extra_args)
+        seg_args["uncond"] = div["uc"]
+        seg_args["cond_scale"] = div["cfg"]
+        _switch_turbo(div, run, 0.0)
+
+        run["coarse_segments"] = run.get("coarse_segments", 0) + 1
+        run["coarse_steps"] = run.get("coarse_steps", 0) + new_len
+        _log(f"diversity: coarse segment {seg_index} at scale {scale:g}: {orig_len} -> "
+             f"{new_len} steps, sigma {float(new_sigmas[0]):.4f}->"
+             f"{float(new_sigmas[-1]):.4f}, CFG {div['cfg']:g}")
+        return new_sigmas, seg_args, index_map
+
+    return hook
+
+
+def _switch_turbo(div: dict, run: dict, scale: float):
+    """Turbo LoRA to ``base * scale`` (0 for coarse, 1 for fine), once per
+    change: online payloads are a cheap write, baked ones a weight rewrite."""
+    if run.get("turbo_scale", 1.0) == scale:
+        return
+    _set_turbo_strength(div["entries"], scale)
+    if div["baked"]:
+        cls = SpeedForgeScript
+        unet = div["p"].sd_model.forge_objects.unet
+        if scale != 1.0:
+            cls._pin_turbo_backups(unet, div["baked"])
+            cls.turbo_unbaked = (unet, div["baked"])
+        n, total, seconds = _switch_baked(unet, div["baked"], scale)
+        if scale == 1.0:
+            cls.turbo_unbaked = None
+        _log(f"diversity: Turbo LoRA {'off' if scale == 0.0 else 'back on'} "
+             f"({n} of {total} weights rewritten, {seconds:.2f} s)")
+    run["turbo_scale"] = scale
+
+
+def _bump_total_steps(model, extra_steps: int, run: dict):
+    """``CFGDenoiser.total_steps`` is compared with its per-call ``step`` for
+    Skip Early CFG, NGMS parity and the refiner switch; add the extra calls a
+    re-densified segment makes. Restored by ``_finish_diversity``."""
+    total = getattr(model, "total_steps", None)
+    if not isinstance(total, int) or extra_steps == 0:
+        return
+    if "total_steps_backup" not in run:
+        run["total_steps_backup"] = total
+    steps = getattr(model, "steps", None)
+    mult = max(1, round(total / steps)) if isinstance(steps, int) and steps > 0 else 1
+    model.total_steps = max(1, total + extra_steps * mult)
+
+
+def _finish_diversity(div: dict, model, run: dict):
+    """Undo the pass-scoped changes. Runs on success and on interruption, so
+    an interrupted coarse segment does not leave the Turbo LoRA at 0."""
+    _switch_turbo(div, run, 1.0)
+    if "total_steps_backup" in run and model is not None:
+        model.total_steps = run["total_steps_backup"]
+
+
+def _diversity_infotext(div: dict, run: dict) -> str:
+    parts = [f"ref={div['ref_steps']}", f"cfg={div['cfg']:g}"]
+    if div.get("lora_label"):
+        parts.append(f"lora={div['lora_label']}")
+    if div["entries"]:
+        parts.append("switch=online")
+    parts.append(f"coarse={run.get('coarse_steps', 0)}")
+    return (f"diversity({', '.join(parts)})"
+            + (" experimental" if div.get("experimental") else ""))
+
+
 def _make_speed_func(base_fn, cfg: dict):
     """Wrap a k-diffusion ``sample_*`` function with SPEED segmentation."""
 
@@ -158,6 +801,13 @@ def _make_speed_func(base_fn, cfg: dict):
              f"mode={cfg['mode_label']}, transform={cfg['transform']}, "
              f"scales={cfg['scales']}, seed={cfg['seed']}")
 
+        SpeedForgeScript.started_passes += 1
+        div = cfg.get("diversity")
+        hook = None
+        run = {}
+        if div is not None:
+            hook = _make_diversity_hook(div, model, float(sigmas[-1]), run)
+
         import k_diffusion.sampling as kds
         prev_torch = kds.torch
         kds.torch = _ShapeSafeRandn(prev_torch, cfg["seed"])
@@ -172,10 +822,22 @@ def _make_speed_func(base_fn, cfg: dict):
                 adaptive_delta=cfg["adaptive_delta"], ref_latent=cfg["ref_latent"],
                 ref_shift=cfg["ref_shift"], sigma_divisor=cfg["sigma_divisor"],
                 sampler_kwargs=kwargs, full_res_sampler_kwargs=full_res_kwargs,
-                log_fn=_log,
+                log_fn=_log, segment_hook=hook,
             )
         finally:
             kds.torch = prev_torch
+            if div is not None:
+                _finish_diversity(div, model, run)
+
+        if div is not None:
+            if run.get("coarse_segments"):
+                p = div["p"]
+                p.extra_generation_params["SPEED"] = (
+                    f"{div['infotext_base']} {_diversity_infotext(div, run)}")
+            elif not run.get("no_transition_logged"):
+                _log("diversity: no coarse segment ran in this pass (it starts below "
+                     "the transition sigma, or the sigma divisor dropped the "
+                     "transition); RAW stage not applied")
 
         SpeedForgeScript.completed_passes += 1
         return result
@@ -191,7 +853,32 @@ class SpeedForgeScript(scripts.Script):
     config: dict | None = None
     apply_hr: bool = False
     wrapped_passes: int = 0
+    started_passes: int = 0
     completed_passes: int = 0
+    # RAW composition stage: settings for this run when it is active (feature
+    # on, SPEED on, supported model), else None.
+    diversity: dict | None = None
+    # Turbo LoRA routing. ``turbo_route`` is ``(patterns, "bake" | "online")``
+    # for the loader interception this run (None = pass everything through);
+    # ``turbo_membership`` is the route of the last run, to null the stock
+    # loader's hash only when a change needs a reload. Adoptions deliberately
+    # persist across runs: the stock loader reuses its LoRA application while
+    # its hash is unchanged, and so do the live payloads. Staleness is checked
+    # against the cached load per run and the sampling unet per pass.
+    turbo_route: tuple | None = None
+    turbo_membership: tuple | None = None
+    turbo_cycle_open: bool = False
+    turbo_entries: list = []      # online: (OnlineLoRAPatch, base strength, LoRA name)
+    turbo_baked: list = []        # baked: (key, adapter, base strength, LoRA name)
+    turbo_baked_patterns: tuple | None = None
+    turbo_blockers: list = []
+    # (unet, baked entries) while the baked Turbo LoRA is switched off, so
+    # postprocess can put it back if a pass ended between the two switches.
+    turbo_unbaked: tuple | None = None
+    # Backups of the Turbo keys swapped for pinned copies (see _pin_backups);
+    # ``turbo_pin_off`` is why pinning was given up for this session, if it was.
+    turbo_pinned: bool = False
+    turbo_pin_off: str | None = None
 
     def title(self):
         return "SPEED (Spectral Progressive Diffusion)"
@@ -199,7 +886,44 @@ class SpeedForgeScript(scripts.Script):
     def show(self, is_img2img):
         return scripts.AlwaysVisible
 
+    def after_component(self, component, **kwargs):
+        """Catch the two core components the CFG 1.0 unlock has to drive.
+
+        Exact elem_id matches, not suffixes: ``txt2img_distilled_cfg_scale`` and
+        ``img2img_image_cfg_scale`` would both answer to "ends with _cfg_scale".
+        """
+        elem_id = getattr(component, "elem_id", None)
+        if elem_id in ("txt2img_cfg_scale", "img2img_cfg_scale"):
+            self._cfg_scale = component
+        elif elem_id in ("txt2img_neg_prompt", "img2img_neg_prompt"):
+            self._negative_prompt = component
+
+    def _wire_cfg_unlock(self, enabled, diversity_enabled):
+        """Push the negative prompt box's editability when either checkbox
+        changes; the substituted ``modules.ui.use_cfg`` covers every later CFG
+        slider change. Without a captured CFG slider (a reordered UI) the
+        handler unlocks on tick and leaves the box alone on untick."""
+        negative_prompt = getattr(self, "_negative_prompt", None)
+        if negative_prompt is None:
+            return
+        cfg_scale = getattr(self, "_cfg_scale", None)
+        inputs = [enabled, diversity_enabled] + ([] if cfg_scale is None else [cfg_scale])
+        for checkbox in (enabled, diversity_enabled):
+            checkbox.change(
+                fn=functools.partial(cfg_unlock.unlock_update, self._tab),
+                inputs=inputs,
+                outputs=[negative_prompt],
+                queue=False,
+                show_progress=False,
+            )
+        # ui-config.json is applied to the values after ui() has run, so the
+        # flag can only be seeded once the whole UI exists.
+        tab = self._tab
+        script_callbacks.on_app_started(lambda demo, app: cfg_unlock.set_enabled(
+            tab, bool(enabled.value) and bool(diversity_enabled.value)))
+
     def ui(self, is_img2img):
+        self._tab = "img2img" if is_img2img else "txt2img"
         with InputAccordion(False, label=self.title()) as enabled:
             gr.Markdown(
                 "Runs early denoising steps at a reduced latent resolution, then "
@@ -292,21 +1016,176 @@ class SpeedForgeScript(scripts.Script):
                 value=False, label="Apply to hires-fix pass (experimental)",
                 visible=not is_img2img,
             )
+            with InputAccordion(False, label="Diversity: RAW composition stage (Krea 2)") \
+                    as diversity_enabled:
+                gr.Markdown(
+                    "For a RAW checkpoint with a Turbo LoRA in the prompt. While SPEED "
+                    "runs its reduced-resolution steps, the Turbo LoRA is held at "
+                    "strength 0, the negative prompt is applied with real CFG, and "
+                    "those steps run at the density of a 28-step RAW schedule. From the "
+                    "first full-resolution step on, the Turbo LoRA returns at its "
+                    "prompt strength and sampling continues at the main CFG. Stands "
+                    "down when no prompt LoRA matches the pattern. Tested on Krea 2; "
+                    "Z-Image and FLUX.2 Klein run as experimental. Step-scheduled "
+                    "prompt syntax shifts its switch points while this is on."
+                )
+                with gr.Row():
+                    diversity_cfg = gr.Slider(
+                        minimum=1.0, maximum=10.0, step=0.5, value=4.5, label="RAW CFG",
+                        info="CFG for the reduced-resolution steps, standard convention "
+                             "(4.5 here equals Krea's 3.5).",
+                    )
+                    diversity_pattern = gr.Textbox(
+                        value="turbo", label="Turbo LoRA pattern",
+                        info="Comma-separated, case-insensitive filename substrings. "
+                             "Only matching prompt LoRAs are switched; all others keep "
+                             "their prompt strength.",
+                    )
+                diversity_bake = gr.Checkbox(
+                    value=True, label="Bake the Turbo LoRA (faster)",
+                    info="Switch it by rewriting its weights twice per image, keeping "
+                         "both stages at native speed. Off: load it on the fly, which "
+                         "needs no rewrites but adds a weight merge to every model "
+                         "call (much slower on large checkpoints).",
+                )
+
+        self._wire_cfg_unlock(enabled, diversity_enabled)
 
         return [enabled, transform, mode, model_preset, scales, adaptive_delta,
                 delta, sigma_divisor, manual_sigmas, spectrum_A, spectrum_beta,
-                seed, apply_hr]
+                seed, apply_hr, diversity_enabled, diversity_cfg,
+                diversity_pattern, diversity_bake]
 
-    def before_process_batch(self, p, enabled, transform, mode, model_preset,
-                             scales, adaptive_delta, delta, sigma_divisor,
-                             manual_sigmas, spectrum_A, spectrum_beta, seed,
-                             apply_hr, *args, **kwargs):
+    @staticmethod
+    def _resolve_diversity(p, enabled, raw_cfg, pattern, bake=True):
+        """Settings dict for this run, or None (feature off or standing down)."""
+        if not enabled:
+            return None
+        model_class = type(getattr(p, "sd_model", None)).__name__
+        if model_class not in DIVERSITY_MODELS:
+            _log(f"diversity: RAW composition stage is for Krea 2 (and, experimental, "
+                 f"Z-Image / FLUX.2 Klein); this model is {model_class}, standing down.")
+            return None
+        patterns = _parse_patterns(pattern)
+        if not patterns:
+            _log("diversity: Turbo LoRA pattern is empty; standing down.")
+            return None
+        experimental = DIVERSITY_MODELS[model_class]
+        if experimental:
+            _log(f"diversity: RAW composition stage on {model_class} is experimental "
+                 "(uncalibrated; tested on Krea 2 only).")
+        return {
+            "ref_steps": RAW_REFERENCE_STEPS,
+            "cfg": float(raw_cfg),
+            "patterns": patterns,
+            "bake": bool(bake),
+            "experimental": experimental,
+            "model_class": model_class,
+        }
+
+    def before_process_batch(self, p, *args, **kwargs):
+        # Runs before extra_networks.activate (modules/processing.py), which is
+        # where the Turbo LoRA gets loaded, so the route set here is the one
+        # the loader interception sees for this batch.
+        self._configure_run(p, *args, **kwargs)
+        self._update_turbo_route(p)
+        tab = getattr(self, "_tab", None)
+        if tab is not None and len(args) >= 14:
+            # Resync the unlock flag with what this run was started with.
+            cfg_unlock.set_enabled(tab, bool(args[0]) and bool(args[13]))
+
+    @staticmethod
+    def _update_turbo_route(p):
+        cls = SpeedForgeScript
+        cls.turbo_cycle_open = False
+        div = cls.diversity
+        route = (div["patterns"], "bake" if div["bake"] else "online") if div else None
+        if route is not None and not _install_lora_interception():
+            cls.diversity = None
+            route = None
+        cls.turbo_route = route
+        # Drop adoptions that are no longer in the cached load: they would
+        # only pin the old LoRA tensors in memory.
+        model = getattr(p, "sd_model", None)
+        cached = (getattr(model, "forge_objects_after_applying_lora", None)
+                  or getattr(model, "forge_objects", None))
+        cls.turbo_entries, cls.turbo_baked = cls._live_turbo_entries(
+            getattr(cached, "unet", None))
+        if cls.turbo_pinned and not cls.turbo_baked:
+            cls.turbo_pinned = False
+            _release_pinned()
+        if route != cls.turbo_membership:
+            old, cls.turbo_membership = cls.turbo_membership, route
+            if cls._reload_needed(old, route):
+                cls.turbo_entries = []
+                cls.turbo_baked = []
+                cls.turbo_blockers = []
+                _null_lora_hash(p)
+
+    @staticmethod
+    def _pin_turbo_backups(unet, baked):
+        cls = SpeedForgeScript
+        if cls.turbo_pin_off is not None:
+            return
+        keys = list(dict.fromkeys(e[0] for e in baked))
+        try:
+            result = _pin_backups(unet, keys)
+        except Exception as e:
+            cls.turbo_pin_off = str(e)
+            _log(f"diversity: could not pin the Turbo weight backups ({e}); the "
+                 "switch copies from pageable memory for the rest of this session.")
+            return
+        if result is None:
+            cls.turbo_pin_off = "budget"
+            _log(f"diversity: the Turbo weight backups need more than "
+                 f"{_PIN_RAM_SHARE:.0%} of system RAM; not pinning them.")
+            return
+        n, size, seconds = result
+        if n:
+            cls.turbo_pinned = True
+            _log(f"diversity: pinned {n} Turbo weight backups "
+                 f"({size / 2 ** 30:.2f} GB, {seconds:.2f} s, once per load)")
+
+    @staticmethod
+    def _reload_needed(old, new) -> bool:
+        """Whether a route change must make the stock loader reload.
+
+        The route is not part of the loader's hash. On-the-fly routing changes
+        how the Turbo LoRA is loaded, so any change to or from it reloads.
+        Baking leaves the load as Forge does it and only needs to have seen
+        it: switching off keeps the cache, and switching (back) on reuses it
+        when the payloads adopted for the same patterns are still loaded.
+        """
+        if "online" in (old and old[1], new and new[1]):
+            return True
+        if new is None:
+            return False
+        cls = SpeedForgeScript
+        return not (cls.turbo_baked and cls.turbo_baked_patterns == new[0])
+
+    @staticmethod
+    def _live_turbo_entries(unet):
+        """``(online, baked)`` adoptions present in ``unet``."""
+        cls = SpeedForgeScript
+        wrappers = getattr(unet, "weight_wrapper_patches", None) or {}
+        live = {id(obj) for objs in wrappers.values() for obj in objs}
+        online = [e for e in cls.turbo_entries if id(e[0]) in live]
+        return online, _live_baked(cls.turbo_baked, unet)
+
+    def _configure_run(self, p, enabled, transform, mode, model_preset,
+                       scales, adaptive_delta, delta, sigma_divisor,
+                       manual_sigmas, spectrum_A, spectrum_beta, seed,
+                       apply_hr, diversity_enabled=False,
+                       diversity_cfg=4.5, diversity_pattern="turbo",
+                       diversity_bake=True, *args, **kwargs):
         cls = SpeedForgeScript
         cls.enabled = bool(enabled)
         cls.config = None
         cls.apply_hr = bool(apply_hr)
         cls.wrapped_passes = 0
+        cls.started_passes = 0
         cls.completed_passes = 0
+        cls.diversity = None
         if not cls.enabled:
             return
 
@@ -367,6 +1246,64 @@ class SpeedForgeScript(scripts.Script):
             + f"seed={seed}"
         )
 
+        cls.diversity = self._resolve_diversity(
+            p, diversity_enabled, diversity_cfg, diversity_pattern,
+            diversity_bake)
+
+    @staticmethod
+    def _diversity_runtime(p, div: dict, uc):
+        """Per-pass state for the segment hook, or None to stand down this pass.
+
+        Built here rather than inside the sampler wrapper because both calls
+        must happen outside sampling: the encode goes through Forge's cond
+        cache, and ``get_sigmas`` is wrapped by other extensions (Neo-LoraCtl
+        captures the schedule from it), so calling it during the pass would
+        overwrite what they captured for the real schedule.
+        """
+        cls = SpeedForgeScript
+        if cls.turbo_blockers:
+            _log("diversity: Turbo LoRA " + "; ".join(cls.turbo_blockers)
+                 + ". RAW composition stage skipped for this run.")
+            return None
+        unet = getattr(getattr(p.sd_model, "forge_objects", None), "unet", None)
+        entries, baked = cls._live_turbo_entries(unet)
+        # Clones share payload objects and adapters, so whatever is live in the
+        # sampling unet is the current adoption; the rest is a stale load.
+        cls.turbo_entries, cls.turbo_baked = entries, baked
+        if not entries and not baked:
+            _log(f"diversity: no prompt LoRA matches the Turbo pattern "
+                 f"'{', '.join(div['patterns'])}'; RAW composition stage skipped for "
+                 "this run (it needs a Turbo LoRA to switch off).")
+            return None
+
+        if uc is None:
+            try:
+                uc = _encode_negative(p)
+            except Exception as e:
+                _log(f"diversity: could not encode the negative prompt ({e}); RAW stage "
+                     "skipped for this pass.")
+                return None
+        try:
+            reference = [float(s) for s in p.sampler.get_sigmas(p, div["ref_steps"])]
+        except Exception as e:
+            _log(f"diversity: could not build the {div['ref_steps']}-step reference "
+                 f"schedule ({e}); RAW stage skipped for this pass.")
+            return None
+        note = _guidance_overrides_note(p)
+        if note:
+            _log(f"diversity: {note}.")
+        return {
+            **div,
+            "uc": uc,
+            "reference": reference,
+            "entries": entries,
+            "baked": baked,
+            "lora_label": "+".join(f"{name}:{base:g}" for name, base in dict.fromkeys(
+                [(e[2], e[1]) for e in entries] + [(e[3], e[2]) for e in baked])),
+            "p": p,
+            "infotext_base": p.extra_generation_params.get("SPEED", ""),
+        }
+
     def process_before_every_sampling(self, p, *args, **kwargs):
         cls = SpeedForgeScript
         if not cls.enabled or cls.config is None:
@@ -395,7 +1332,11 @@ class SpeedForgeScript(scripts.Script):
         if getattr(sampler.func, "_speed_wrapped", False):
             return
 
-        sampler.func = _make_speed_func(sampler.func, dict(cls.config))
+        pass_cfg = dict(cls.config)
+        if cls.diversity is not None and not getattr(p, "is_hr_pass", False):
+            pass_cfg["diversity"] = self._diversity_runtime(p, cls.diversity, kwargs.get("uc"))
+
+        sampler.func = _make_speed_func(sampler.func, pass_cfg)
         cls.wrapped_passes += 1
 
     def postprocess(self, p, processed, *args):
@@ -403,11 +1344,27 @@ class SpeedForgeScript(scripts.Script):
         if cls.enabled:
             if cls.wrapped_passes == 0:
                 _log("enabled but no sampling pass was wrapped; nothing was applied.")
-            elif cls.completed_passes == 0:
+            elif cls.started_passes == 0:
                 _log("sampler was wrapped but the SPEED function never ran; "
                      "check the console for earlier errors.")
+        # Park the Turbo LoRA at its prompt strength between generations. The
+        # wrapper already does this per pass; this covers a run that ended
+        # some other way. Entries persist (see the class attributes).
+        _set_turbo_strength(cls.turbo_entries, 1.0)
+        if cls.turbo_unbaked is not None:
+            unet, baked = cls.turbo_unbaked
+            cls.turbo_unbaked = None
+            try:
+                _switch_baked(unet, baked, 1.0)
+            except Exception as e:
+                _log(f"diversity: could not re-bake the Turbo LoRA ({e}); the next "
+                     "generation reloads the model's LoRA weights.")
+                _null_lora_hash(p)
+        cls.turbo_cycle_open = False
         cls.enabled = False
         cls.config = None
         cls.apply_hr = False
         cls.wrapped_passes = 0
+        cls.started_passes = 0
         cls.completed_passes = 0
+        cls.diversity = None
