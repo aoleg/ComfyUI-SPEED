@@ -31,7 +31,7 @@ import types
 import gradio as gr
 import torch
 
-from modules import errors, scripts
+from modules import errors, script_callbacks, scripts
 from modules.ui_components import InputAccordion
 
 EXT_ROOT = scripts.basedir()
@@ -74,6 +74,30 @@ def _load_speed_core():
 
 
 speed_core = _load_speed_core()
+
+
+def _load_cfg_unlock():
+    """Load ``scripts/lib_speed_forge/cfg_unlock.py`` once per process. Forge
+    only runs the files directly in ``scripts/``, and a UI reload re-runs this
+    script without restarting Python: reusing the module keeps its per-tab
+    flags and the record of what it substituted in ``modules.ui``."""
+    name = "comfyui_speed_forge_cfg_unlock"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(
+        name, os.path.join(EXT_ROOT, "scripts", "lib_speed_forge", "cfg_unlock.py"))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+cfg_unlock = _load_cfg_unlock()
+cfg_unlock.register()
 
 
 class _ShapeSafeRandn:
@@ -606,7 +630,44 @@ class SpeedForgeScript(scripts.Script):
     def show(self, is_img2img):
         return scripts.AlwaysVisible
 
+    def after_component(self, component, **kwargs):
+        """Catch the two core components the CFG 1.0 unlock has to drive.
+
+        Exact elem_id matches, not suffixes: ``txt2img_distilled_cfg_scale`` and
+        ``img2img_image_cfg_scale`` would both answer to "ends with _cfg_scale".
+        """
+        elem_id = getattr(component, "elem_id", None)
+        if elem_id in ("txt2img_cfg_scale", "img2img_cfg_scale"):
+            self._cfg_scale = component
+        elif elem_id in ("txt2img_neg_prompt", "img2img_neg_prompt"):
+            self._negative_prompt = component
+
+    def _wire_cfg_unlock(self, enabled, diversity_enabled):
+        """Push the negative prompt box's editability when either checkbox
+        changes; the substituted ``modules.ui.use_cfg`` covers every later CFG
+        slider change. Without a captured CFG slider (a reordered UI) the
+        handler unlocks on tick and leaves the box alone on untick."""
+        negative_prompt = getattr(self, "_negative_prompt", None)
+        if negative_prompt is None:
+            return
+        cfg_scale = getattr(self, "_cfg_scale", None)
+        inputs = [enabled, diversity_enabled] + ([] if cfg_scale is None else [cfg_scale])
+        for checkbox in (enabled, diversity_enabled):
+            checkbox.change(
+                fn=functools.partial(cfg_unlock.unlock_update, self._tab),
+                inputs=inputs,
+                outputs=[negative_prompt],
+                queue=False,
+                show_progress=False,
+            )
+        # ui-config.json is applied to the values after ui() has run, so the
+        # flag can only be seeded once the whole UI exists.
+        tab = self._tab
+        script_callbacks.on_app_started(lambda demo, app: cfg_unlock.set_enabled(
+            tab, bool(enabled.value) and bool(diversity_enabled.value)))
+
     def ui(self, is_img2img):
+        self._tab = "img2img" if is_img2img else "txt2img"
         with InputAccordion(False, label=self.title()) as enabled:
             gr.Markdown(
                 "Runs early denoising steps at a reduced latent resolution, then "
@@ -731,6 +792,8 @@ class SpeedForgeScript(scripts.Script):
                              "their prompt strength.",
                     )
 
+        self._wire_cfg_unlock(enabled, diversity_enabled)
+
         return [enabled, transform, mode, model_preset, scales, adaptive_delta,
                 delta, sigma_divisor, manual_sigmas, spectrum_A, spectrum_beta,
                 seed, apply_hr, diversity_enabled, diversity_ref_steps,
@@ -768,6 +831,10 @@ class SpeedForgeScript(scripts.Script):
         # the loader interception sees for this batch.
         self._configure_run(p, *args, **kwargs)
         self._update_turbo_route(p)
+        tab = getattr(self, "_tab", None)
+        if tab is not None and len(args) >= 14:
+            # Resync the unlock flag with what this run was started with.
+            cfg_unlock.set_enabled(tab, bool(args[0]) and bool(args[13]))
 
     @staticmethod
     def _update_turbo_route(p):

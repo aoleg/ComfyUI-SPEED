@@ -27,6 +27,7 @@ sys.path.insert(0, str(_ROOT))
 # =============================================================================
 
 _reported_errors = []
+_registered = {"before_ui": [], "after_component": [], "app_started": []}
 
 
 def _install_stubs():
@@ -59,7 +60,13 @@ def _install_stubs():
     shared_stub.opts = SimpleNamespace(skip_early_cond=0.0)
     shared_stub.sd_model = None
 
+    callbacks_stub = types.ModuleType("modules.script_callbacks")
+    callbacks_stub.on_before_ui = _registered["before_ui"].append
+    callbacks_stub.on_after_component = _registered["after_component"].append
+    callbacks_stub.on_app_started = _registered["app_started"].append
+
     modules_stub = types.ModuleType("modules")
+    modules_stub.script_callbacks = callbacks_stub
     modules_stub.scripts = scripts_stub
     modules_stub.errors = errors_stub
     modules_stub.ui_components = ui_components_stub
@@ -77,6 +84,7 @@ def _install_stubs():
     sys.modules["modules.errors"] = errors_stub
     sys.modules["modules.ui_components"] = ui_components_stub
     sys.modules["modules.prompt_parser"] = prompt_parser_stub
+    sys.modules["modules.script_callbacks"] = callbacks_stub
     sys.modules["modules.shared"] = shared_stub
     sys.modules["k_diffusion"] = k_diffusion_stub
     sys.modules["k_diffusion.sampling"] = kds_stub
@@ -150,6 +158,7 @@ sys.modules["speed_forge_under_test"] = speed_forge
 _spec.loader.exec_module(speed_forge)
 
 speed_core = speed_forge.speed_core
+cfg_unlock = speed_forge.cfg_unlock
 
 
 # =============================================================================
@@ -1110,6 +1119,258 @@ class TestTurboLoRA(ForgeScriptTestCase):
         self.assertEqual(len(speed_forge.SpeedForgeScript.turbo_entries), 2)
         self.assertTrue(p.extra_generation_params["SPEED"].endswith(
             "lora=krea2_turbo_lora_rank_64_bf16:0.5, coarse=10)"))
+
+
+
+# =============================================================================
+# Negative prompt unlock (scripts/lib_speed_forge/cfg_unlock.py)
+# =============================================================================
+
+def forge_use_cfg(val):
+    """modules/ui.py's rule, with a recognizable return value."""
+    return "skip" if val is None else ("forge", val > 1.0)
+
+
+class FakeNag:
+    """Neo-Krea2-NAG's lib_krea2_nag/cfg_unlock.py, reduced to its substitution
+    logic: install at before_ui (recognizing only its own tag), overwrite at
+    img2img_cfg_scale."""
+
+    def __init__(self, ui):
+        self.ui = ui
+        self.original = None
+        self.enabled = {"txt2img": False, "img2img": False}
+
+    def make(self, tab):
+        def use_cfg(val):
+            if self.enabled[tab]:
+                return ("update", {"interactive": True})
+            return self.original(val)
+        use_cfg._krea2_nag_tab = tab
+        return use_cfg
+
+    def install(self):
+        current = self.ui.use_cfg
+        if getattr(current, "_krea2_nag_tab", None) is None:
+            self.original = current
+        self.ui.use_cfg = self.make("txt2img")
+
+    def swap(self, component, **kw):
+        if self.original is not None and component.elem_id == "img2img_cfg_scale":
+            self.ui.use_cfg = self.make("img2img")
+
+
+class TestCfgUnlock(unittest.TestCase):
+    def setUp(self):
+        self.ui = types.ModuleType("modules.ui")
+        self.ui.use_cfg = forge_use_cfg
+        sys.modules["modules.ui"] = self.ui
+        sys.modules["modules"].ui = self.ui
+        self.saved_gr = cfg_unlock.gr
+        cfg_unlock.gr = SimpleNamespace(update=lambda **kw: ("update", kw), skip=lambda: "skip")
+        cfg_unlock._enabled.update(txt2img=False, img2img=False)
+        cfg_unlock._installed = False
+        cfg_unlock._base_use_cfg = None
+
+    def tearDown(self):
+        cfg_unlock.gr = self.saved_gr
+        sys.modules.pop("modules.ui", None)
+        if hasattr(sys.modules["modules"], "ui"):
+            del sys.modules["modules"].ui
+
+    def build(self, before_ui, after_component):
+        """modules/ui.py create_ui: which use_cfg each .change() binding captures."""
+        for cb in before_ui:
+            cb()
+        bindings = {}
+
+        def component(elem_id):
+            for cb in after_component:
+                cb(SimpleNamespace(elem_id=elem_id))
+
+        for elem_id in ("txt2img_prompt", "txt2img_neg_prompt", "txt2img_cfg_scale"):
+            component(elem_id)
+        bindings["txt2img"] = self.ui.use_cfg
+        for elem_id in ("txt2img_hr_cfg", "hires_neg_prompt"):
+            component(elem_id)
+        bindings["hires"] = self.ui.use_cfg
+        for elem_id in ("img2img_neg_prompt", "img2img_cfg_scale", "img2img_image_cfg_scale"):
+            component(elem_id)
+        bindings["img2img"] = self.ui.use_cfg
+        return bindings
+
+    @staticmethod
+    def unlocked(result):
+        return result == ("update", {"interactive": True}) or result == ("forge", True)
+
+    def test_registered_with_forge_callbacks(self):
+        self.assertIn(cfg_unlock._before_ui, _registered["before_ui"])
+        self.assertIn(cfg_unlock._on_component, _registered["after_component"])
+
+    def test_alone_each_tab_has_its_own_flag(self):
+        b = self.build([cfg_unlock._before_ui], [cfg_unlock._on_component])
+        self.assertEqual(b["txt2img"](1.0), ("forge", False))
+        self.assertEqual(b["txt2img"](4.0), ("forge", True))
+        self.assertEqual(b["txt2img"](None), "skip")
+        cfg_unlock.set_enabled("txt2img", True)
+        self.assertTrue(self.unlocked(b["txt2img"](1.0)))
+        self.assertEqual(b["img2img"](1.0), ("forge", False))
+        cfg_unlock.set_enabled("img2img", True)
+        cfg_unlock.set_enabled("txt2img", False)
+        self.assertTrue(self.unlocked(b["img2img"](1.0)))
+        self.assertEqual(b["txt2img"](1.0), ("forge", False))
+
+    def test_hires_negative_box_keeps_forges_rule(self):
+        b = self.build([cfg_unlock._before_ui], [cfg_unlock._on_component])
+        cfg_unlock.set_enabled("txt2img", True)
+        self.assertIs(b["hires"], forge_use_cfg)
+
+    def _check_chain(self, b, nag):
+        for spd_t in (False, True):
+            for spd_i in (False, True):
+                for nag_t in (False, True):
+                    for nag_i in (False, True):
+                        cfg_unlock.set_enabled("txt2img", spd_t)
+                        cfg_unlock.set_enabled("img2img", spd_i)
+                        nag.enabled.update(txt2img=nag_t, img2img=nag_i)
+                        flags = (spd_t, spd_i, nag_t, nag_i)
+                        self.assertEqual(self.unlocked(b["txt2img"](1.0)), spd_t or nag_t, flags)
+                        self.assertEqual(self.unlocked(b["img2img"](1.0)), spd_i or nag_i, flags)
+                        # NAG's own variant still drives the hires box; ours does not
+                        self.assertEqual(self.unlocked(b["hires"](1.0)), nag_t, flags)
+                        for tab in ("txt2img", "img2img"):
+                            self.assertTrue(self.unlocked(b[tab](4.0)), flags)
+
+    def test_chains_with_nag_in_either_callback_order(self):
+        for ours_first in (True, False):
+            with self.subTest(ours_first=ours_first):
+                self.setUp()
+                nag = FakeNag(self.ui)
+                before = [cfg_unlock._before_ui, nag.install]
+                after = [cfg_unlock._on_component, nag.swap]
+                if not ours_first:
+                    before.reverse()
+                    after.reverse()
+                self._check_chain(self.build(before, after), nag)
+
+    def test_survives_a_ui_reload(self):
+        b = self.build([cfg_unlock._before_ui], [cfg_unlock._on_component])
+        b = self.build([cfg_unlock._before_ui], [cfg_unlock._on_component])
+        cfg_unlock.set_enabled("img2img", True)
+        self.assertEqual(b["txt2img"](1.0), ("forge", False))
+        self.assertTrue(self.unlocked(b["img2img"](1.0)))
+        self.assertIs(b["hires"], forge_use_cfg)
+
+    def test_reload_with_nag_ours_first_is_exact(self):
+        nag = FakeNag(self.ui)
+        before = [cfg_unlock._before_ui, nag.install]
+        after = [cfg_unlock._on_component, nag.swap]
+        self.build(before, after)
+        self._check_chain(self.build(before, after), nag)
+
+    def test_reload_with_nag_first_never_locks_wrongly(self):
+        nag = FakeNag(self.ui)
+        before = [nag.install, cfg_unlock._before_ui]
+        after = [nag.swap, cfg_unlock._on_component]
+        self.build(before, after)
+        b = self.build(before, after)
+        for spd_t in (False, True):
+            for spd_i in (False, True):
+                for nag_t in (False, True):
+                    for nag_i in (False, True):
+                        cfg_unlock.set_enabled("txt2img", spd_t)
+                        cfg_unlock.set_enabled("img2img", spd_i)
+                        nag.enabled.update(txt2img=nag_t, img2img=nag_i)
+                        if spd_t or nag_t:
+                            self.assertTrue(self.unlocked(b["txt2img"](1.0)))
+                        if spd_i or nag_i:
+                            self.assertTrue(self.unlocked(b["img2img"](1.0)))
+                        if not any((spd_t, spd_i, nag_t, nag_i)):
+                            # locked, by Forge's function or by the re-entry fallback
+                            for tab in ("txt2img", "img2img"):
+                                self.assertIn(b[tab](1.0), (("forge", False),
+                                              ("update", {"interactive": False})))
+                        for tab in ("txt2img", "img2img"):
+                            self.assertTrue(self.unlocked(b[tab](4.0)) or
+                                            b[tab](4.0) == ("update", {"interactive": True}))
+
+    def test_unlock_update_needs_both_checkboxes(self):
+        self.build([cfg_unlock._before_ui], [cfg_unlock._on_component])
+        self.assertEqual(cfg_unlock.unlock_update("txt2img", True, True, 1.0),
+                         ("update", {"interactive": True}))
+        self.assertTrue(cfg_unlock.is_enabled("txt2img"))
+        self.assertEqual(cfg_unlock.unlock_update("txt2img", True, False, 1.0), ("forge", False))
+        self.assertFalse(cfg_unlock.is_enabled("txt2img"))
+        self.assertEqual(cfg_unlock.unlock_update("txt2img", False, True, 4.0), ("forge", True))
+        self.assertEqual(cfg_unlock.unlock_update("txt2img", False, True), "skip")
+        self.assertFalse(cfg_unlock.is_enabled("img2img"))
+
+
+class TestUnlockWiring(ForgeScriptTestCase):
+    def setUp(self):
+        super().setUp()
+        accordion = sys.modules["modules.ui_components"].InputAccordion
+        self.saved_side_effect = accordion.side_effect
+        accordion.side_effect = lambda *a, **kw: MagicMock()
+        cfg_unlock._enabled.update(txt2img=False, img2img=False)
+
+    def tearDown(self):
+        sys.modules["modules.ui_components"].InputAccordion.side_effect = self.saved_side_effect
+        cfg_unlock._enabled.update(txt2img=False, img2img=False)
+
+    def _build(self, is_img2img, with_cfg=True):
+        script = speed_forge.SpeedForgeScript()
+        prefix = "img2img" if is_img2img else "txt2img"
+        neg = SimpleNamespace(elem_id=f"{prefix}_neg_prompt")
+        cfg = SimpleNamespace(elem_id=f"{prefix}_cfg_scale")
+        script.after_component(neg)
+        script.after_component(SimpleNamespace(elem_id=f"{prefix}_distilled_cfg_scale"))
+        if with_cfg:
+            script.after_component(cfg)
+        script.after_component(SimpleNamespace(elem_id=f"{prefix}_image_cfg_scale"))
+        n_started = len(_registered["app_started"])
+        components = script.ui(is_img2img)
+        return script, components, neg, cfg, _registered["app_started"][n_started:]
+
+    def test_both_checkboxes_push_the_update(self):
+        script, components, neg, cfg, started = self._build(False)
+        self.assertEqual(len(components), 17)
+        enabled, diversity = components[0], components[13]
+        self.assertIsNot(enabled, diversity)
+        for checkbox in (enabled, diversity):
+            checkbox.change.assert_called_once()
+            kw = checkbox.change.call_args.kwargs
+            self.assertEqual(kw["inputs"], [enabled, diversity, cfg])
+            self.assertEqual(kw["outputs"], [neg])
+            self.assertIs(kw["fn"].func, cfg_unlock.unlock_update)
+            self.assertEqual(kw["fn"].args, ("txt2img",))
+
+        # seeded from the saved values once the app has started
+        self.assertEqual(len(started), 1)
+        enabled.value, diversity.value = True, False
+        started[0](None, None)
+        self.assertFalse(cfg_unlock.is_enabled("txt2img"))
+        diversity.value = True
+        started[0](None, None)
+        self.assertTrue(cfg_unlock.is_enabled("txt2img"))
+        self.assertFalse(cfg_unlock.is_enabled("img2img"))
+
+    def test_img2img_tab_and_missing_cfg_slider(self):
+        script, components, neg, cfg, _ = self._build(True, with_cfg=False)
+        kw = components[0].change.call_args.kwargs
+        self.assertEqual(kw["inputs"], [components[0], components[13]])
+        self.assertEqual(kw["fn"].args, ("img2img",))
+
+    def test_run_resyncs_the_flag(self):
+        script, _, _, _, _ = self._build(True)
+        p = make_div_p(RecordingSampler())
+        run_before(script, p, **DIV_UI)
+        self.assertTrue(cfg_unlock.is_enabled("img2img"))
+        run_before(script, p, **{**DIV_UI, "diversity_enabled": False})
+        self.assertFalse(cfg_unlock.is_enabled("img2img"))
+        run_before(script, p, enabled=False, **DIV_UI)
+        self.assertFalse(cfg_unlock.is_enabled("img2img"))
+        self.assertFalse(cfg_unlock.is_enabled("txt2img"))
 
 
 if __name__ == "__main__":
