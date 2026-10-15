@@ -169,6 +169,13 @@ def _anima_reference_latents_active(p) -> bool:
 # FLUX.2 Klein have community Turbo LoRAs and run uncalibrated.
 DIVERSITY_MODELS = {"Krea2": False, "ZImage": True, "Flux2": True}
 
+# Step count of the RAW reference schedule whose part above the transition
+# sigma the coarse segments run (28 = diffusers' Krea 2 default). Fixed, not a
+# setting: in live tests on Krea 2 every denser reference (36, 44, 52)
+# distorted small faces in wide shots (waxy skin, uneven eyes, smeared
+# mouths) at RAW CFG 3.5 and 4.5 and with 9 Turbo steps, while 28 stayed clean.
+RAW_REFERENCE_STEPS = 28
+
 # Tolerance for "this sigma is on the reference schedule". Schedules are float32.
 _SIGMA_TOL = 1e-4
 
@@ -1015,7 +1022,7 @@ class SpeedForgeScript(scripts.Script):
                     "For a RAW checkpoint with a Turbo LoRA in the prompt. While SPEED "
                     "runs its reduced-resolution steps, the Turbo LoRA is held at "
                     "strength 0, the negative prompt is applied with real CFG, and "
-                    "those steps run at the density the RAW model expects. From the "
+                    "those steps run at the density of a 28-step RAW schedule. From the "
                     "first full-resolution step on, the Turbo LoRA returns at its "
                     "prompt strength and sampling continues at the main CFG. Stands "
                     "down when no prompt LoRA matches the pattern. Tested on Krea 2; "
@@ -1023,12 +1030,6 @@ class SpeedForgeScript(scripts.Script):
                     "prompt syntax shifts its switch points while this is on."
                 )
                 with gr.Row():
-                    diversity_ref_steps = gr.Slider(
-                        minimum=28, maximum=52, step=1, value=28, label="Reference steps",
-                        info="Steps the RAW model would run on its own (28 = diffusers "
-                             "default, 52 = official repo). Only the part above SPEED's "
-                             "transition sigma runs.",
-                    )
                     diversity_cfg = gr.Slider(
                         minimum=1.0, maximum=10.0, step=0.5, value=4.5, label="RAW CFG",
                         info="CFG for the reduced-resolution steps, standard convention "
@@ -1052,11 +1053,11 @@ class SpeedForgeScript(scripts.Script):
 
         return [enabled, transform, mode, model_preset, scales, adaptive_delta,
                 delta, sigma_divisor, manual_sigmas, spectrum_A, spectrum_beta,
-                seed, apply_hr, diversity_enabled, diversity_ref_steps,
-                diversity_cfg, diversity_pattern, diversity_bake]
+                seed, apply_hr, diversity_enabled, diversity_cfg,
+                diversity_pattern, diversity_bake]
 
     @staticmethod
-    def _resolve_diversity(p, enabled, ref_steps, raw_cfg, pattern, bake=True):
+    def _resolve_diversity(p, enabled, raw_cfg, pattern, bake=True):
         """Settings dict for this run, or None (feature off or standing down)."""
         if not enabled:
             return None
@@ -1074,7 +1075,7 @@ class SpeedForgeScript(scripts.Script):
             _log(f"diversity: RAW composition stage on {model_class} is experimental "
                  "(uncalibrated; tested on Krea 2 only).")
         return {
-            "ref_steps": int(ref_steps),
+            "ref_steps": RAW_REFERENCE_STEPS,
             "cfg": float(raw_cfg),
             "patterns": patterns,
             "bake": bool(bake),
@@ -1174,7 +1175,7 @@ class SpeedForgeScript(scripts.Script):
     def _configure_run(self, p, enabled, transform, mode, model_preset,
                        scales, adaptive_delta, delta, sigma_divisor,
                        manual_sigmas, spectrum_A, spectrum_beta, seed,
-                       apply_hr, diversity_enabled=False, diversity_ref_steps=28,
+                       apply_hr, diversity_enabled=False,
                        diversity_cfg=4.5, diversity_pattern="turbo",
                        diversity_bake=True, *args, **kwargs):
         cls = SpeedForgeScript
@@ -1246,7 +1247,7 @@ class SpeedForgeScript(scripts.Script):
         )
 
         cls.diversity = self._resolve_diversity(
-            p, diversity_enabled, diversity_ref_steps, diversity_cfg, diversity_pattern,
+            p, diversity_enabled, diversity_cfg, diversity_pattern,
             diversity_bake)
 
     @staticmethod

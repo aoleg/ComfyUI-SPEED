@@ -340,7 +340,7 @@ UI_DEFAULTS = dict(transform="dct", mode="manual", model_preset="flux",
                    scales="0.5,1.0", adaptive_delta=True, delta=0.01,
                    sigma_divisor=1.03, manual_sigmas="0.72",
                    spectrum_A=203.615097, spectrum_beta=1.915461, seed=-1,
-                   apply_hr=False, diversity_enabled=False, diversity_ref_steps=28,
+                   apply_hr=False, diversity_enabled=False,
                    diversity_cfg=4.5, diversity_pattern="turbo", diversity_bake=True)
 
 
@@ -351,7 +351,7 @@ def run_before(script, p, enabled=True, seeds=(123,), **overrides):
         p, enabled, ui["transform"], ui["mode"], ui["model_preset"],
         ui["scales"], ui["adaptive_delta"], ui["delta"], ui["sigma_divisor"],
         ui["manual_sigmas"], ui["spectrum_A"], ui["spectrum_beta"], ui["seed"],
-        ui["apply_hr"], ui["diversity_enabled"], ui["diversity_ref_steps"],
+        ui["apply_hr"], ui["diversity_enabled"],
         ui["diversity_cfg"], ui["diversity_pattern"], ui["diversity_bake"],
         seeds=list(seeds), prompts=["test"], subseeds=[0])
 
@@ -1183,7 +1183,7 @@ class TestTurboLoRA(ForgeScriptTestCase):
         fake_activate(p, DEFAULT_LORAS)
         cached = m.current_lora_hash
         self.assertEqual(before(), cached)                            # on -> on
-        self.assertEqual(before(diversity_cfg=6.0, diversity_ref_steps=40), cached)
+        self.assertEqual(before(diversity_cfg=6.0), cached)
         self.assertIsNone(before(diversity_pattern="turbo, lightning"))  # pattern
         fake_activate(p, DEFAULT_LORAS)
         self.assertIsNone(before(diversity_enabled=False))            # on -> off
@@ -1790,7 +1790,7 @@ class TestUnlockWiring(ForgeScriptTestCase):
 
     def test_both_checkboxes_push_the_update(self):
         script, components, neg, cfg, started = self._build(False)
-        self.assertEqual(len(components), 18)
+        self.assertEqual(len(components), 17)
         enabled, diversity = components[0], components[13]
         self.assertIsNot(enabled, diversity)
         for checkbox in (enabled, diversity):

@@ -51,10 +51,11 @@ For the community recipe of a Krea 2 RAW checkpoint plus the Turbo LoRA in the p
 
 | Control | Default | Meaning |
 |---|---|---|
-| Reference steps | 28 | The step count the RAW model would run on its own, 28 (diffusers default) to 52 (official repo). Only the part of that schedule above SPEED's transition sigma runs, so 28 gives about 8 to 10 RAW steps at the `krea-2` preset's transition. Built with your scheduler and the model's shift. |
 | RAW CFG | 4.5 | CFG for the RAW stage, in the standard convention used by Forge, ComfyUI and SwarmUI. Krea computes `cond + g * (cond - uncond)`, so 4.5 here equals Krea's 3.5. |
 | Turbo LoRA pattern | `turbo` | Comma-separated, case-insensitive substrings of the LoRA filename. Only matching prompt LoRAs are switched; every other LoRA keeps its prompt strength the whole run. |
 | Bake the Turbo LoRA (faster) | on | How the Turbo LoRA is switched. See below. |
+
+The RAW steps follow a fixed 28-step reference schedule (the diffusers default for Krea 2), built with your scheduler and the model's shift; only its part above SPEED's transition sigma runs, about 8 to 10 steps at the `krea-2` preset's transition. It is not a setting because in live tests every denser reference (36, 44, 52) distorted small faces in wide shots (waxy skin, uneven eyes, smeared mouths), at RAW CFG 3.5 and 4.5 and with 9 Turbo steps, while 28 stayed clean.
 
 - **A Turbo LoRA in the prompt is required.** When no prompt LoRA matches the pattern, the stage stands down for the run with a console line and SPEED runs as usual. It never runs real CFG on a model it cannot switch off Turbo for.
 - **The negative prompt box stays editable at CFG 1** while both the SPEED checkbox and the subsection are on, and goes back to Forge's rule when either is off. The negative prompt only acts in the RAW stage.
