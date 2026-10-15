@@ -14,8 +14,8 @@ sampler function (the math is shared with the ComfyUI node via
 Designed for flow-matching models (Flux, Wan, ...) whose sigmas live in
 (0, 1]; eps-prediction models (SD1.x/SDXL) run but are unvalidated.
 
-The "RAW composition stage" subsection (Forge Neo only, see
-docs/krea2-hybrid-plan.md) passes a ``segment_hook`` into the shared core:
+The "RAW composition stage" subsection (Forge Neo only) passes a
+``segment_hook`` into the shared core:
 coarse segments get the encoded negative prompt, a real CFG scale and the
 step density of a RAW reference schedule; fine segments get Forge's own
 ``extra_args`` untouched.
