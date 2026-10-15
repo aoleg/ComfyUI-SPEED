@@ -487,6 +487,139 @@ class TestAdaptiveDelta(unittest.TestCase):
                 self.assertAlmostEqual(back, target, places=6)
 
 
+class TestSigmaDivisorAtTopOfSchedule(unittest.TestCase):
+    """A ``sigma_divisor`` below 1.0 can push a threshold to or past 1.0.
+
+    Reported on Forge Neo (krea-2, 1536x1536, 12 steps, adaptive on, divisor
+    0.9): adaptive pins sigma* to 0.9000, 0.9 / 0.9 lands at 1.0000000000092,
+    and the step-fraction cap then raised in ``reference_coarse_fraction``.
+    Such a threshold means "no coarse steps"; the transition is dropped and
+    the run starts at the next scale up.
+    """
+
+    KREA = _speed_core._PRESETS["krea-2"]
+
+    def _schedule(self, steps, mu=1.15):
+        # Forge Neo runs Flux-family models at a flat mu=1.15.
+        shift = math.exp(mu)
+        ts = [1.0 - i / steps for i in range(steps)]
+        return torch.tensor([shift * t / (shift * t + 1.0 - t) for t in ts] + [0.0])
+
+    def _plan(self, preset, latent, scales, divisor, steps=12, adaptive=True, log_fn=None):
+        return _speed_core._plan_transitions(
+            self._schedule(steps), scales, 0.01, preset["A"], preset["beta"],
+            latent, latent, adaptive=adaptive, ref_latent=preset["ref_latent"],
+            ref_shift=preset.get("ref_shift"), sigma_divisor=divisor, log_fn=log_fn)
+
+    @staticmethod
+    def _recording_sampler(calls):
+        def sampler(model, x, sigmas, extra_args=None, callback=None, disable=None, **kw):
+            calls.append({"shape": tuple(x.shape), "sigmas": sigmas.tolist()})
+            return x.clone()
+        return sampler
+
+    def _run(self, x, sigmas, scales, divisor, log_fn=None):
+        calls = []
+        out = _speed_core.sample_speed_core(
+            self._recording_sampler(calls), None, x, sigmas, disable=True,
+            mode="delta_optimal", scales=scales, delta=0.01,
+            spectrum_A=self.KREA["A"], spectrum_beta=self.KREA["beta"],
+            adaptive_delta=True, ref_latent=self.KREA["ref_latent"],
+            ref_shift=self.KREA["ref_shift"], sigma_divisor=divisor, log_fn=log_fn)
+        return calls, out
+
+    def test_reported_crash_drops_the_transition(self):
+        logged = []
+        first, transitions = self._plan(self.KREA, 192, [0.5, 1.0], 0.9,
+                                        log_fn=logged.append)
+        self.assertEqual((first, transitions), (1, []))
+        dropped = [m for m in logged if "dropping it" in m]
+        self.assertEqual(len(dropped), 1)
+        self.assertIn("0.5->1", dropped[0])
+        self.assertIn("SPEED is effectively off", dropped[0])
+        # The public wrapper must not raise either.
+        self.assertEqual(_speed_core._resolve_transitions(
+            self._schedule(12), [0.5, 1.0], 0.01, self.KREA["A"], self.KREA["beta"],
+            192, 192, adaptive=True, ref_latent=128, ref_shift=self.KREA["ref_shift"],
+            sigma_divisor=0.9), [])
+
+    def test_reported_crash_runs_one_plain_full_resolution_segment(self):
+        # No step-0 downscale/expand: the sampler sees the untouched seed noise
+        # and the unpatched schedule, exactly as a run without SPEED would.
+        sigmas = self._schedule(12)
+        x = torch.randn(1, 4, 192, 192)
+        calls, out = self._run(x, sigmas, [0.5, 1.0], 0.9)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["shape"], (1, 4, 192, 192))
+        self.assertEqual(calls[0]["sigmas"], sigmas.tolist())
+        self.assertTrue(torch.equal(out, x))
+
+    def test_divisor_half_drops_every_transition(self):
+        for scales in ([0.5, 1.0], [0.25, 0.5, 1.0]):
+            with self.subTest(scales=scales):
+                logged = []
+                first, transitions = self._plan(self.KREA, 128, scales, 0.5,
+                                                log_fn=logged.append)
+                self.assertEqual((first, transitions), (len(scales) - 1, []))
+                self.assertEqual(sum("dropping it" in m for m in logged), len(scales) - 1)
+                self.assertFalse(any("not all transitions fit" in m for m in logged))
+
+    def test_only_the_leading_transitions_are_dropped(self):
+        # krea-2 at 128: sigma* 0.9707 (0.25->0.5) and 0.9000 (0.5->1). A
+        # divisor between the two drops the first and keeps the second.
+        t1, t2 = delta_optimal_transitions([0.25, 0.5, 1.0], 0.01, self.KREA["A"],
+                                           self.KREA["beta"], 128, 128)
+        divisor = (t1 + t2) / 2.0
+        first, transitions = self._plan(self.KREA, 128, [0.25, 0.5, 1.0], divisor, steps=40)
+        self.assertEqual(first, 1)
+        self.assertEqual(len(transitions), 1)
+        self.assertEqual(transitions[0][1:], (0.5, 1.0))
+        self.assertGreater(transitions[0][0], 0)
+
+        calls, out = self._run(torch.randn(1, 4, 128, 128), self._schedule(40),
+                               [0.25, 0.5, 1.0], divisor)
+        self.assertEqual([c["shape"] for c in calls], [(1, 4, 64, 64), (1, 4, 128, 128)])
+        self.assertEqual(out.shape, (1, 4, 128, 128))
+
+    def test_no_crash_across_the_ui_divisor_range(self):
+        # Forge Neo's slider spans 0.5..2.0; every preset, adaptive on and off,
+        # with and without ref_shift.
+        divisors = [0.5 + 0.05 * k for k in range(31)]
+        for name, preset in _speed_core._PRESETS.items():
+            if preset is None:
+                continue
+            for adaptive in (True, False):
+                for latent in (64, 128, 192, 384):
+                    for scales in ([0.5, 1.0], [0.25, 0.5, 1.0]):
+                        for steps in (12, 40):
+                            for divisor in divisors:
+                                with self.subTest(preset=name, adaptive=adaptive,
+                                                  latent=latent, scales=scales,
+                                                  steps=steps, divisor=divisor):
+                                    first, transitions = self._plan(
+                                        preset, latent, scales, divisor,
+                                        steps=steps, adaptive=adaptive)
+                                    indices = [idx for idx, _, _ in transitions]
+                                    self.assertEqual(indices, sorted(indices))
+                                    self.assertTrue(all(idx > 0 for idx in indices))
+                                    if transitions:
+                                        self.assertEqual(transitions[0][1], scales[first])
+
+    def test_divisors_that_stay_below_the_top_drop_nothing(self):
+        # The guard only engages at t* >= 1: 1.03 (the neo_shift default) and
+        # the 0.9 case at a resolution where the divided t* stays below 1.
+        logged = []
+        first, transitions = self._plan(self.KREA, 192, [0.5, 1.0], 1.03,
+                                        log_fn=logged.append)
+        self.assertEqual(first, 0)
+        self.assertEqual(len(transitions), 1)
+        first, transitions = self._plan(self.KREA, 192, [0.5, 1.0], 0.9,
+                                        adaptive=False, log_fn=logged.append)
+        self.assertEqual(first, 0)
+        self.assertEqual(len(transitions), 1)
+        self.assertFalse(any("dropping it" in m for m in logged))
+
+
 class TestKappaAndAlign(unittest.TestCase):
     def test_kappa_at_t0(self):
         self.assertAlmostEqual(kappa(0.0, 2.0), 2.0)

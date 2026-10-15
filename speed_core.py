@@ -434,9 +434,48 @@ def _resolve_transitions(
     identical to plain ``delta_optimal``. Values above 1.0 lower the
     threshold (transition later, more coarse steps, more speed); values below
     1.0 raise it (transition earlier, fewer coarse steps, more conservative).
+
+    A divisor below 1.0 can push a threshold to or past 1.0, the top of the
+    flow schedule (krea-2 at delta 0.01 pins to sigma* 0.9000 with adaptive
+    on, and 0.9 / 0.9 lands a hair above 1.0). That threshold means "no coarse
+    steps at all", and such a transition is dropped rather than placed at step
+    0 -- see ``_plan_transitions``. This function returns only the transitions
+    that survive; use ``_plan_transitions`` to also learn which scale the run
+    then starts at.
+    """
+    return _plan_transitions(
+        sigmas, scales, delta, A, beta, H_full, W_full,
+        adaptive=adaptive, ref_latent=ref_latent, ref_shift=ref_shift,
+        sigma_divisor=sigma_divisor, log_fn=log_fn,
+    )[1]
+
+
+def _plan_transitions(
+    sigmas: torch.Tensor, scales: List[float], delta: float, A: float, beta: float,
+    H_full: int, W_full: int,
+    adaptive: bool = False, ref_latent: int = REFERENCE_LATENT,
+    ref_shift: float = None,
+    sigma_divisor: float = 1.0,
+    log_fn: Callable[[str], None] = None,
+) -> Tuple[int, List[Tuple[int, float, float]]]:
+    """Return ``(first, transitions)``: ``_resolve_transitions`` plus a start scale.
+
+    ``first`` indexes ``scales`` at the scale sampling starts at. It is 0
+    unless a resolved threshold sits at or above 1.0, which only a
+    ``sigma_divisor`` below 1.0 produces (Eq. 10 thresholds are below 1 by
+    construction). Such a transition would land at step 0: the initial DCT
+    truncation would throw away the high band of the user's seed noise, no
+    coarse step would run, and the expansion would refill that band with
+    freshly seeded noise and patch sigma[0] to the aligned timestep -- no
+    compute saved, and an output that no longer matches a plain run. So it is
+    dropped instead, and the run starts at the next scale up. Thresholds fall
+    along the ladder, so the dropped ones are always a leading run; dropping
+    all of them leaves ``first == len(scales) - 1``, a plain full-resolution
+    run. It also keeps an out-of-range ``t*`` away from
+    ``reference_coarse_fraction``, which only accepts ``(0, 1)``.
     """
     if len(scales) < 2:
-        return []
+        return 0, []
     t_stars = delta_optimal_transitions(scales, delta, A, beta, H_full, W_full)
     n_steps = len(sigmas) - 1
 
@@ -466,8 +505,19 @@ def _resolve_transitions(
         t_stars = divided
 
     n_transitions = len(scales) - 1
+    first = 0
     out: List[Tuple[int, float, float]] = []
     for i, (s_old, s_new, t_thr) in enumerate(zip(scales[:-1], scales[1:], t_stars)):
+        if t_thr >= 1.0:
+            first = i + 1
+            if log_fn is not None:
+                log_fn(
+                    f"sigma divisor {sigma_divisor:g} puts the {s_old:g}->{s_new:g} "
+                    f"transition at sigma* {t_thr:.4f}, at or above the top of the "
+                    f"schedule; dropping it and starting at scale {s_new:g} -- no "
+                    "coarse steps, so SPEED is effectively off for this transition."
+                )
+            continue
         step_idx = next(
             (j for j in range(n_steps) if float(sigmas[j]) <= t_thr),
             n_steps,
@@ -502,7 +552,7 @@ def _resolve_transitions(
         if step_idx >= n_steps:
             break
         out.append((step_idx, s_old, s_new))
-    return out
+    return first, out
 
 
 def _resolve_manual(
@@ -618,17 +668,21 @@ def sample_speed_core(
                           callback=callback, disable=disable,
                           **{**sampler_kwargs, **full_res_sampler_kwargs})
 
-    first_scale = scales[0]
     if mode == "delta_optimal":
-        transitions = _resolve_transitions(
+        first, transitions = _plan_transitions(
             sigmas, scales, delta, spectrum_A, spectrum_beta, H_full, W_full,
             adaptive=adaptive_delta, ref_latent=ref_latent, ref_shift=ref_shift,
             sigma_divisor=sigma_divisor, log_fn=log_fn,
         )
+        # Transitions dropped at the top of the schedule (see _plan_transitions)
+        # take their coarse scales with them. Dropping all of them leaves
+        # [1.0], which the loop below runs as one full-resolution segment.
+        scales = scales[first:]
     elif mode == "manual":
         transitions = _resolve_manual(sigmas, scales, manual_sigmas or [])
     else:
         raise ValueError(f"mode must be delta_optimal|manual, got {mode!r}")
+    first_scale = scales[0]
 
     if log_fn is not None:
         plan = ", ".join(
