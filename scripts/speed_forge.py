@@ -26,7 +26,9 @@ import functools
 import importlib.util
 import os
 import sys
+import time
 import types
+import uuid
 
 import gradio as gr
 import torch
@@ -176,17 +178,26 @@ def _parse_patterns(text) -> tuple:
     return tuple(t.strip().lower() for t in str(text or "").split(",") if t.strip())
 
 
-# --- Turbo LoRA: per-file online routing -------------------------------------
+# --- Turbo LoRA: switching it per segment ------------------------------------
 #
 # Forge bakes prompt LoRAs into the weights at extra_networks.activate through
-# networks.load_lora_for_models. Loaded with online_mode=True instead, each
-# patch becomes an OnlineLoRAPatch in the patcher's weight_wrapper_patches,
-# re-applied on every module forward from its mutable payload, so writing
-# ``obj.patch[0][0]`` changes the next model call. That is what Forge's own
-# LoRA Control Integrated does per step; this routes only the files matching
-# the Turbo pattern (the way Neo-LoraCtl intercepts the loader) and drives
-# their strength per segment. Every other LoRA reaches the stock loader with
-# its original arguments.
+# networks.load_lora_for_models. The loader is intercepted (the way Neo-LoraCtl
+# does it) so the patches of the files matching the Turbo pattern can be
+# adopted; every other LoRA reaches the stock loader with its original
+# arguments. Two ways to switch the adopted LoRA:
+#
+# * bake (default): the load is left exactly as Forge does it, and the switch
+#   rewrites the Turbo-patched weights from the patcher's backups twice per
+#   pass, off before the coarse segments and back on before the first fine
+#   one. Native speed in both stages; the fine stage runs on the same weights
+#   a plain baked run uses. The rewrite mirrors Forge's patch_weight_to_device
+#   (Neo-LoraCtl's _rebake_keys, which its Seed Variance section runs live).
+# * online: the matching files are loaded with online_mode=True, so each patch
+#   becomes an OnlineLoRAPatch re-applied on every module forward from its
+#   mutable payload, and writing ``obj.patch[0][0]`` changes the next call
+#   (what Forge's own LoRA Control Integrated does). No weight rewrites, but a
+#   weight clone and merge on every model call, which measured about 0.9 s per
+#   call on a 12.8 GB int8 Krea 2 checkpoint.
 
 _original_load_lora_for_models = None
 
@@ -231,35 +242,155 @@ def _install_lora_interception() -> bool:
     return True
 
 
+def _payload_error(entry) -> str | None:
+    if not isinstance(entry, (tuple, list)) or len(entry) != _PATCH_PAYLOAD_LEN:
+        got = len(entry) if isinstance(entry, (tuple, list)) else type(entry).__name__
+        return f"patch payload arity mismatch: expected {_PATCH_PAYLOAD_LEN}, got {got}"
+    if not isinstance(entry[0], (int, float)) or isinstance(entry[0], bool):
+        return f"patch strength is not a number: {type(entry[0]).__name__}"
+    return None
+
+
 def _validate_patch_object(obj) -> str | None:
     """Error string if ``obj`` does not look like the OnlineLoRAPatch this was
     written against (same check as Neo-LoraCtl's), else None."""
     patch = getattr(obj, "patch", None)
     if not isinstance(patch, list) or len(patch) < 1:
         return f"patch object has no 1+-element .patch list: {type(obj).__name__}"
-    entry = patch[0]
-    if not isinstance(entry, (tuple, list)) or len(entry) != _PATCH_PAYLOAD_LEN:
-        got = len(entry) if isinstance(entry, (tuple, list)) else type(entry).__name__
-        return f"patch payload arity mismatch: expected {_PATCH_PAYLOAD_LEN}, got {got}"
-    if not isinstance(entry[0], (int, float)) or isinstance(entry[0], bool):
-        return f"patch strength is not a number: {type(entry[0]).__name__}"
+    err = _payload_error(patch[0])
+    if err is not None:
+        return err
     if not callable(obj):
         return f"patch object is not callable: {type(obj).__name__}"
     return None
 
 
-def _set_patch_strength(obj, strength: float):
-    entry = obj.patch[0]
+def _set_payload_strength(container: list, index: int, strength: float):
+    entry = container[index]
     if isinstance(entry, list):
         entry[0] = strength
     else:
-        obj.patch[0] = (strength,) + tuple(entry[1:])
+        container[index] = (strength,) + tuple(entry[1:])
 
 
 def _set_turbo_strength(entries, scale: float):
-    """Write ``base * scale`` into every adopted Turbo payload."""
+    """Write ``base * scale`` into every adopted online Turbo payload."""
     for obj, base, _label in entries:
-        _set_patch_strength(obj, base * scale)
+        _set_payload_strength(obj.patch, 0, base * scale)
+
+
+def _locate_baked(patches: dict, key: str, adapter):
+    """``(list, index)`` of a baked payload in one patcher's ``patches``, found
+    by adapter identity: clones copy the per-key lists but share the payloads'
+    adapter objects, and a strength write may replace the payload itself."""
+    plist = patches.get(key) if patches else None
+    if not plist:
+        return None
+    for i, entry in enumerate(plist):
+        if (isinstance(entry, (tuple, list)) and len(entry) == _PATCH_PAYLOAD_LEN
+                and entry[1] is adapter):
+            return plist, i
+    return None
+
+
+def _live_baked(entries, unet):
+    patches = getattr(unet, "patches", None)
+    return [e for e in entries if _locate_baked(patches, e[0], e[1]) is not None]
+
+
+def _rebake_keys(patcher, keys):
+    """Recompute the given keys' live weights from the patcher's pristine
+    backups plus whatever its ``patches`` currently say (Turbo payloads
+    included, at their current strength). Copied from Neo-LoraCtl
+    (scripts/neo_loractl.py), which mirrors Forge's patch_weight_to_device
+    (backend/patcher/base.py) except that it sources from the backup: the
+    live weight is already merged and merging onto it would double-apply.
+
+    A key with no backup is untouched: its patches are applied per forward
+    (lowvram path; partially_unload restores and pops the backup when it
+    moves a module there), so the payload change alone already took effect.
+    Returns the number of keys rewritten."""
+    import torch
+    from backend import memory_management, utils as backend_utils
+    from backend.float import stochastic_rounding
+    from backend.patcher.base import get_key_weight
+    from backend.patcher.lora import merge_lora_to_weight, string_to_seed
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    done = 0
+    for key in keys:
+        bk = patcher.backup.get(key)
+        if bk is None:
+            continue
+        weight, set_func, convert_func = get_key_weight(patcher.model, key)
+        remaining = [p for p in patcher.patches.get(key, []) if p[0] != 0.0]
+        if not remaining:
+            # Pure restore: mimic unpatch_model, the backup is the raw
+            # original (quantized checkpoints included), set it back as-is.
+            restored = bk.weight.to(weight.device, copy=True)
+            if bk.inplace_update:
+                backend_utils.copy_to_param(patcher.model, key, restored)
+            else:
+                backend_utils.set_attr(patcher.model, key, restored)
+            done += 1
+            continue
+        temp_dtype = memory_management.lora_compute_dtype(weight.device)
+        temp = memory_management.cast_to_device(bk.weight, weight.device,
+                                                temp_dtype, copy=True)
+        if convert_func is not None:
+            temp = convert_func(temp, inplace=True)
+        out = merge_lora_to_weight(remaining, temp, key)
+        if set_func is None:
+            out = stochastic_rounding(out, weight.dtype, seed=string_to_seed(key))
+            if bk.inplace_update:
+                backend_utils.copy_to_param(patcher.model, key, out)
+            else:
+                backend_utils.set_attr(patcher.model, key, out)
+        else:
+            set_func(out, inplace_update=bk.inplace_update, seed=string_to_seed(key))
+        done += 1
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return done
+
+
+def _set_baked_strength(unet, entries, scale: float) -> list:
+    """Write ``base * scale`` into the baked Turbo payloads of ``unet``;
+    returns the keys whose weights must be rewritten."""
+    affected = []
+    for key, adapter, base, _label in entries:
+        loc = _locate_baked(unet.patches, key, adapter)
+        if loc is None:
+            continue
+        _set_payload_strength(loc[0], loc[1], base * scale)
+        if key not in affected:
+            affected.append(key)
+    return affected
+
+
+def _switch_baked(unet, entries, scale: float):
+    """Flip the baked Turbo LoRA to ``base * scale`` in place.
+
+    Edits the payloads of the unet that is loaded for sampling (lowvram keys
+    read that patcher's lists per forward) and rewrites the merged weights.
+    patches_uuid is deliberately left alone: a bump would make the next load
+    unpatch and repatch the whole model. If the rewrite fails, the payloads
+    go back to base, a second rewrite is tried, and the uuid is bumped so the
+    next load rebuilds every weight from its backup either way.
+    """
+    started = time.perf_counter()
+    keys = _set_baked_strength(unet, entries, scale)
+    try:
+        n = _rebake_keys(unet, keys)
+    except Exception:
+        _set_baked_strength(unet, entries, 1.0)
+        try:
+            _rebake_keys(unet, keys)
+        finally:
+            unet.patches_uuid = uuid.uuid4()
+        raise
+    return n, len(keys), time.perf_counter() - started
 
 
 def _global_online_lora() -> bool:
@@ -273,12 +404,12 @@ def _global_online_lora() -> bool:
 def _turbo_owner(filename, online_mode) -> str | None:
     """Why another writer already owns this file's patch strengths, or None.
 
-    Two writers on ``patch[0][0]`` would fight every step, so the feature
-    stands down rather than share: Forge's builtin LoRA Control (its
-    ``<lora:name:[a:b]>`` mapping, keyed by filename), Neo-LoraCtl when its
-    filter schedules this file (its default filter excludes accelerator
-    LoRAs), or any outer interceptor that already asked for online loading
-    while the global on-the-fly option is off.
+    Two writers on the same payloads would fight, so the feature stands down
+    rather than share: Forge's builtin LoRA Control (its ``<lora:name:[a:b]>``
+    mapping, keyed by filename), Neo-LoraCtl when its filter schedules this
+    file (its default filter excludes accelerator LoRAs), or any outer
+    interceptor that already asked for online loading while the global
+    on-the-fly option is off.
     """
     for data in getattr(scripts, "scripts_data", None) or []:
         script_class = getattr(data, "script_class", None)
@@ -304,14 +435,16 @@ def _turbo_owner(filename, online_mode) -> str | None:
 def _intercepted_load_lora_for_models(model, clip, lora, strength_model, strength_clip,
                                       filename="default", online_mode=False):
     cls = SpeedForgeScript
-    if cls.turbo_route is not None and not cls.turbo_cycle_open:
+    route = cls.turbo_route
+    if route is not None and not cls.turbo_cycle_open:
         # First load call of a fresh activation: the stock loader has just
         # reset forge_objects to the originals, so prior adoptions are stale.
         cls.turbo_cycle_open = True
         cls.turbo_entries = []
+        cls.turbo_baked = []
+        cls.turbo_baked_patterns = route[0]
         cls.turbo_blockers = []
-    if (cls.turbo_route is None or model is None
-            or not _lora_matches(filename, cls.turbo_route)):
+    if route is None or model is None or not _lora_matches(filename, route[0]):
         return _original_load_lora_for_models(model, clip, lora, strength_model,
                                               strength_clip, filename, online_mode)
 
@@ -322,30 +455,38 @@ def _intercepted_load_lora_for_models(model, clip, lora, strength_model, strengt
         return _original_load_lora_for_models(model, clip, lora, strength_model,
                                               strength_clip, filename, online_mode)
 
-    wrappers_before = getattr(model, "weight_wrapper_patches", None)
-    before = {k: len(v) for k, v in (wrappers_before or {}).items()}
+    # With the global on-the-fly option on, Forge loads it online whatever we
+    # prefer; drive it that way rather than override the user's setting.
+    online = route[1] == "online" or bool(online_mode)
+    store = "weight_wrapper_patches" if online else "patches"
+    before_store = getattr(model, store, None)
+    before = {k: len(v) for k, v in (before_store or {}).items()}
     result = _original_load_lora_for_models(model, clip, lora, strength_model,
-                                            strength_clip, filename, True)
+                                            strength_clip, filename,
+                                            True if online else online_mode)
     if result is None:
         return result
-    new_model = result[0]
-    wrappers = getattr(new_model, "weight_wrapper_patches", None)
-    if wrappers_before is None or wrappers is None:
-        cls.turbo_blockers.append(f"'{label}': the model has no weight_wrapper_patches "
-                                  "(Forge API drift?)")
+    after_store = getattr(result[0], store, None)
+    if before_store is None or after_store is None:
+        cls.turbo_blockers.append(f"'{label}': the model has no {store} (Forge API drift?)")
         return result
 
     adopted, errors = [], []
-    for key, objs in wrappers.items():
-        for obj in objs[before.get(key, 0):]:
-            err = _validate_patch_object(obj)
+    for key, items in after_store.items():
+        for item in items[before.get(key, 0):]:
+            if online:
+                err = _validate_patch_object(item)
+                if err is None:
+                    adopted.append((item, float(item.patch[0][0]), label))
+            else:
+                err = _payload_error(item)
+                if err is None:
+                    adopted.append((key, item[1], float(item[0]), label))
             if err is not None:
                 errors.append(f"{key}: {err}")
-            else:
-                adopted.append((obj, float(obj.patch[0][0]), label))
     if errors:
-        # The LoRA stays online at its prompt strength: the same output as a
-        # plain <lora:> tag, applied on the fly. The feature stands down.
+        # The LoRA stays applied at its prompt strength, the same output as a
+        # plain <lora:> tag. The feature stands down.
         cls.turbo_blockers.append(f"'{label}': refusing to drive its patches (Forge API "
                                   f"drift?): {errors[0]}"
                                   + (f" (+{len(errors) - 1} more)" if len(errors) > 1 else ""))
@@ -353,7 +494,7 @@ def _intercepted_load_lora_for_models(model, clip, lora, strength_model, strengt
     if not adopted:
         _log(f"diversity: Turbo LoRA '{label}' added no patches to this model.")
         return result
-    cls.turbo_entries.extend(adopted)
+    (cls.turbo_entries if online else cls.turbo_baked).extend(adopted)
     return result
 
 
@@ -456,11 +597,11 @@ def _make_diversity_hook(div: dict, model, schedule_end: float, run: dict):
                 run["no_transition_logged"] = True
                 _log("diversity: no full-resolution segment follows; RAW stage not "
                      "applied to this pass")
-            _set_turbo_strength(div["entries"], 1.0)
+            _switch_turbo(div, run, 1.0)
             return seg_sigmas, extra_args, None
         if not coarse:
             # Turbo LoRA back at the prompt strength before the first fine call.
-            _set_turbo_strength(div["entries"], 1.0)
+            _switch_turbo(div, run, 1.0)
             run["fine_segments"] = run.get("fine_segments", 0) + 1
             return seg_sigmas, extra_args, None
 
@@ -485,7 +626,7 @@ def _make_diversity_hook(div: dict, model, schedule_end: float, run: dict):
         seg_args = dict(extra_args)
         seg_args["uncond"] = div["uc"]
         seg_args["cond_scale"] = div["cfg"]
-        _set_turbo_strength(div["entries"], 0.0)
+        _switch_turbo(div, run, 0.0)
 
         run["coarse_segments"] = run.get("coarse_segments", 0) + 1
         run["coarse_steps"] = run.get("coarse_steps", 0) + new_len
@@ -495,6 +636,25 @@ def _make_diversity_hook(div: dict, model, schedule_end: float, run: dict):
         return new_sigmas, seg_args, index_map
 
     return hook
+
+
+def _switch_turbo(div: dict, run: dict, scale: float):
+    """Turbo LoRA to ``base * scale`` (0 for coarse, 1 for fine), once per
+    change: online payloads are a cheap write, baked ones a weight rewrite."""
+    if run.get("turbo_scale", 1.0) == scale:
+        return
+    _set_turbo_strength(div["entries"], scale)
+    if div["baked"]:
+        cls = SpeedForgeScript
+        unet = div["p"].sd_model.forge_objects.unet
+        if scale != 1.0:
+            cls.turbo_unbaked = (unet, div["baked"])
+        n, total, seconds = _switch_baked(unet, div["baked"], scale)
+        if scale == 1.0:
+            cls.turbo_unbaked = None
+        _log(f"diversity: Turbo LoRA {'off' if scale == 0.0 else 'back on'} "
+             f"({n} of {total} weights rewritten, {seconds:.2f} s)")
+    run["turbo_scale"] = scale
 
 
 def _bump_total_steps(model, extra_steps: int, run: dict):
@@ -514,7 +674,7 @@ def _bump_total_steps(model, extra_steps: int, run: dict):
 def _finish_diversity(div: dict, model, run: dict):
     """Undo the pass-scoped changes. Runs on success and on interruption, so
     an interrupted coarse segment does not leave the Turbo LoRA at 0."""
-    _set_turbo_strength(div["entries"], 1.0)
+    _switch_turbo(div, run, 1.0)
     if "total_steps_backup" in run and model is not None:
         model.total_steps = run["total_steps_backup"]
 
@@ -523,6 +683,8 @@ def _diversity_infotext(div: dict, run: dict) -> str:
     parts = [f"ref={div['ref_steps']}", f"cfg={div['cfg']:g}"]
     if div.get("lora_label"):
         parts.append(f"lora={div['lora_label']}")
+    if div["entries"]:
+        parts.append("switch=online")
     parts.append(f"coarse={run.get('coarse_steps', 0)}")
     return (f"diversity({', '.join(parts)})"
             + (" experimental" if div.get("experimental") else ""))
@@ -557,6 +719,7 @@ def _make_speed_func(base_fn, cfg: dict):
              f"mode={cfg['mode_label']}, transform={cfg['transform']}, "
              f"scales={cfg['scales']}, seed={cfg['seed']}")
 
+        SpeedForgeScript.started_passes += 1
         div = cfg.get("diversity")
         hook = None
         run = {}
@@ -607,22 +770,28 @@ class SpeedForgeScript(scripts.Script):
     config: dict | None = None
     apply_hr: bool = False
     wrapped_passes: int = 0
+    started_passes: int = 0
     completed_passes: int = 0
     # RAW composition stage: settings for this run when it is active (feature
     # on, SPEED on, supported model), else None.
     diversity: dict | None = None
-    # Turbo LoRA routing. ``turbo_route`` is the pattern tuple the loader
-    # interception routes online this run (None = pass everything through);
+    # Turbo LoRA routing. ``turbo_route`` is ``(patterns, "bake" | "online")``
+    # for the loader interception this run (None = pass everything through);
     # ``turbo_membership`` is the route of the last run, to null the stock
-    # loader's hash only when it changes. Adopted entries are (OnlineLoRAPatch,
-    # base strength) and deliberately persist across runs: the stock loader
-    # reuses its LoRA application while its hash is unchanged, and so do the
-    # live objects. Staleness is checked against the live unet per pass.
+    # loader's hash only when a change needs a reload. Adoptions deliberately
+    # persist across runs: the stock loader reuses its LoRA application while
+    # its hash is unchanged, and so do the live payloads. Staleness is checked
+    # against the cached load per run and the sampling unet per pass.
     turbo_route: tuple | None = None
     turbo_membership: tuple | None = None
     turbo_cycle_open: bool = False
-    turbo_entries: list = []      # (OnlineLoRAPatch, base strength, LoRA name)
+    turbo_entries: list = []      # online: (OnlineLoRAPatch, base strength, LoRA name)
+    turbo_baked: list = []        # baked: (key, adapter, base strength, LoRA name)
+    turbo_baked_patterns: tuple | None = None
     turbo_blockers: list = []
+    # (unet, baked entries) while the baked Turbo LoRA is switched off, so
+    # postprocess can put it back if a pass ended between the two switches.
+    turbo_unbaked: tuple | None = None
 
     def title(self):
         return "SPEED (Spectral Progressive Diffusion)"
@@ -791,16 +960,23 @@ class SpeedForgeScript(scripts.Script):
                              "Only matching prompt LoRAs are switched; all others keep "
                              "their prompt strength.",
                     )
+                diversity_bake = gr.Checkbox(
+                    value=True, label="Bake the Turbo LoRA (faster)",
+                    info="Switch it by rewriting its weights twice per image, keeping "
+                         "both stages at native speed. Off: load it on the fly, which "
+                         "needs no rewrites but adds a weight merge to every model "
+                         "call (much slower on large checkpoints).",
+                )
 
         self._wire_cfg_unlock(enabled, diversity_enabled)
 
         return [enabled, transform, mode, model_preset, scales, adaptive_delta,
                 delta, sigma_divisor, manual_sigmas, spectrum_A, spectrum_beta,
                 seed, apply_hr, diversity_enabled, diversity_ref_steps,
-                diversity_cfg, diversity_pattern]
+                diversity_cfg, diversity_pattern, diversity_bake]
 
     @staticmethod
-    def _resolve_diversity(p, enabled, ref_steps, raw_cfg, pattern):
+    def _resolve_diversity(p, enabled, ref_steps, raw_cfg, pattern, bake=True):
         """Settings dict for this run, or None (feature off or standing down)."""
         if not enabled:
             return None
@@ -821,6 +997,7 @@ class SpeedForgeScript(scripts.Script):
             "ref_steps": int(ref_steps),
             "cfg": float(raw_cfg),
             "patterns": patterns,
+            "bake": bool(bake),
             "experimental": experimental,
             "model_class": model_class,
         }
@@ -840,42 +1017,65 @@ class SpeedForgeScript(scripts.Script):
     def _update_turbo_route(p):
         cls = SpeedForgeScript
         cls.turbo_cycle_open = False
-        route = cls.diversity["patterns"] if cls.diversity is not None else None
+        div = cls.diversity
+        route = (div["patterns"], "bake" if div["bake"] else "online") if div else None
         if route is not None and not _install_lora_interception():
             cls.diversity = None
             route = None
         cls.turbo_route = route
+        # Drop adoptions that are no longer in the cached load: they would
+        # only pin the old LoRA tensors in memory.
+        model = getattr(p, "sd_model", None)
+        cached = (getattr(model, "forge_objects_after_applying_lora", None)
+                  or getattr(model, "forge_objects", None))
+        cls.turbo_entries, cls.turbo_baked = cls._live_turbo_entries(
+            getattr(cached, "unet", None))
         if route != cls.turbo_membership:
-            # The route decides how the Turbo LoRA is loaded (online or baked)
-            # but is not part of the stock loader's hash, so a change has to
-            # force the reload. Unchanged, the loader's cache stays valid.
-            cls.turbo_membership = route
-            cls.turbo_entries = []
-            cls.turbo_blockers = []
-            _null_lora_hash(p)
+            old, cls.turbo_membership = cls.turbo_membership, route
+            if cls._reload_needed(old, route):
+                cls.turbo_entries = []
+                cls.turbo_baked = []
+                cls.turbo_blockers = []
+                _null_lora_hash(p)
 
     @staticmethod
-    def _live_turbo_entries(p):
-        """Adopted entries whose objects are in the unet about to sample."""
-        unet = getattr(getattr(getattr(p, "sd_model", None), "forge_objects", None),
-                       "unet", None)
-        wrappers = getattr(unet, "weight_wrapper_patches", None)
-        if not wrappers:
-            return []
+    def _reload_needed(old, new) -> bool:
+        """Whether a route change must make the stock loader reload.
+
+        The route is not part of the loader's hash. On-the-fly routing changes
+        how the Turbo LoRA is loaded, so any change to or from it reloads.
+        Baking leaves the load as Forge does it and only needs to have seen
+        it: switching off keeps the cache, and switching (back) on reuses it
+        when the payloads adopted for the same patterns are still loaded.
+        """
+        if "online" in (old and old[1], new and new[1]):
+            return True
+        if new is None:
+            return False
+        cls = SpeedForgeScript
+        return not (cls.turbo_baked and cls.turbo_baked_patterns == new[0])
+
+    @staticmethod
+    def _live_turbo_entries(unet):
+        """``(online, baked)`` adoptions present in ``unet``."""
+        cls = SpeedForgeScript
+        wrappers = getattr(unet, "weight_wrapper_patches", None) or {}
         live = {id(obj) for objs in wrappers.values() for obj in objs}
-        return [e for e in SpeedForgeScript.turbo_entries if id(e[0]) in live]
+        online = [e for e in cls.turbo_entries if id(e[0]) in live]
+        return online, _live_baked(cls.turbo_baked, unet)
 
     def _configure_run(self, p, enabled, transform, mode, model_preset,
                        scales, adaptive_delta, delta, sigma_divisor,
                        manual_sigmas, spectrum_A, spectrum_beta, seed,
                        apply_hr, diversity_enabled=False, diversity_ref_steps=28,
                        diversity_cfg=4.5, diversity_pattern="turbo",
-                       *args, **kwargs):
+                       diversity_bake=True, *args, **kwargs):
         cls = SpeedForgeScript
         cls.enabled = bool(enabled)
         cls.config = None
         cls.apply_hr = bool(apply_hr)
         cls.wrapped_passes = 0
+        cls.started_passes = 0
         cls.completed_passes = 0
         cls.diversity = None
         if not cls.enabled:
@@ -939,7 +1139,8 @@ class SpeedForgeScript(scripts.Script):
         )
 
         cls.diversity = self._resolve_diversity(
-            p, diversity_enabled, diversity_ref_steps, diversity_cfg, diversity_pattern)
+            p, diversity_enabled, diversity_ref_steps, diversity_cfg, diversity_pattern,
+            diversity_bake)
 
     @staticmethod
     def _diversity_runtime(p, div: dict, uc):
@@ -956,9 +1157,12 @@ class SpeedForgeScript(scripts.Script):
             _log("diversity: Turbo LoRA " + "; ".join(cls.turbo_blockers)
                  + ". RAW composition stage skipped for this run.")
             return None
-        entries = cls._live_turbo_entries(p)
-        cls.turbo_entries = entries
-        if not entries:
+        unet = getattr(getattr(p.sd_model, "forge_objects", None), "unet", None)
+        entries, baked = cls._live_turbo_entries(unet)
+        # Clones share payload objects and adapters, so whatever is live in the
+        # sampling unet is the current adoption; the rest is a stale load.
+        cls.turbo_entries, cls.turbo_baked = entries, baked
+        if not entries and not baked:
             _log(f"diversity: no prompt LoRA matches the Turbo pattern "
                  f"'{', '.join(div['patterns'])}'; RAW composition stage skipped for "
                  "this run (it needs a Turbo LoRA to switch off).")
@@ -985,8 +1189,9 @@ class SpeedForgeScript(scripts.Script):
             "uc": uc,
             "reference": reference,
             "entries": entries,
-            "lora_label": "+".join(f"{name}:{base:g}" for name, base in
-                                   dict.fromkeys((e[2], e[1]) for e in entries)),
+            "baked": baked,
+            "lora_label": "+".join(f"{name}:{base:g}" for name, base in dict.fromkeys(
+                [(e[2], e[1]) for e in entries] + [(e[3], e[2]) for e in baked])),
             "p": p,
             "infotext_base": p.extra_generation_params.get("SPEED", ""),
         }
@@ -1031,17 +1236,27 @@ class SpeedForgeScript(scripts.Script):
         if cls.enabled:
             if cls.wrapped_passes == 0:
                 _log("enabled but no sampling pass was wrapped; nothing was applied.")
-            elif cls.completed_passes == 0:
+            elif cls.started_passes == 0:
                 _log("sampler was wrapped but the SPEED function never ran; "
                      "check the console for earlier errors.")
         # Park the Turbo LoRA at its prompt strength between generations. The
         # wrapper already does this per pass; this covers a run that ended
         # some other way. Entries persist (see the class attributes).
         _set_turbo_strength(cls.turbo_entries, 1.0)
+        if cls.turbo_unbaked is not None:
+            unet, baked = cls.turbo_unbaked
+            cls.turbo_unbaked = None
+            try:
+                _switch_baked(unet, baked, 1.0)
+            except Exception as e:
+                _log(f"diversity: could not re-bake the Turbo LoRA ({e}); the next "
+                     "generation reloads the model's LoRA weights.")
+                _null_lora_hash(p)
         cls.turbo_cycle_open = False
         cls.enabled = False
         cls.config = None
         cls.apply_hr = False
         cls.wrapped_passes = 0
+        cls.started_passes = 0
         cls.completed_passes = 0
         cls.diversity = None

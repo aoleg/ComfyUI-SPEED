@@ -106,7 +106,19 @@ def _default_payload(strength):
     return [strength, "adapter", 1.0, None, None]
 
 
-_PAYLOAD = {"factory": _default_payload}
+def _default_baked(strength, adapter):
+    # baked payloads are tuples in patcher.patches[key]
+    return (strength, adapter, 1.0, None, None)
+
+
+_PAYLOAD = {"factory": _default_payload, "baked": _default_baked}
+
+# adapter objects of the Turbo file's baked payloads, from the latest load
+_TURBO_ADAPTERS = set()
+_UUIDS = iter(range(1, 10 ** 9))
+
+# the original (unpatched) value of every fake weight
+ORIG = 0.0
 
 
 class FakeOnlinePatch:
@@ -119,19 +131,71 @@ class FakeOnlinePatch:
         return weight
 
 
-class FakePatcher:
-    """ModelPatcher's clone semantics: the wrapper dict is copied, its lists
-    are rebound (not mutated) when a wrapper is added."""
+class FakeNet:
+    """The nn.Module side: one weight value per key, shared by every patcher."""
 
     def __init__(self):
+        self.weights = {}
+        self.current_uuid = None
+
+
+class FakePatcher:
+    """ModelPatcher's clone semantics (backend/patcher/base.py): the wrapper
+    dict and per-key patch lists are copied, the model and the backup dict are
+    shared, and the patches uuid carries over."""
+
+    def __init__(self, model=None):
+        self.model = model if model is not None else FakeNet()
         self.weight_wrapper_patches = {}
         self.patches = {}
+        self.backup = {}
+        self.patches_uuid = 0
 
     def clone(self):
-        n = FakePatcher()
+        n = FakePatcher(self.model)
         n.weight_wrapper_patches = self.weight_wrapper_patches.copy()
         n.patches = {k: v[:] for k, v in self.patches.items()}
+        n.backup = self.backup
+        n.patches_uuid = self.patches_uuid
         return n
+
+
+def fake_model_load(unet):
+    """partially_load: a changed uuid restores every backed-up weight and
+    re-merges from the patches dict; an unchanged one leaves weights as they
+    are (already merged)."""
+    net = unet.model
+    if net.current_uuid == unet.patches_uuid:
+        return
+    for key, bk in list(unet.backup.items()):
+        net.weights[key] = bk.weight
+    unet.backup.clear()
+    for key, plist in unet.patches.items():
+        unet.backup[key] = SimpleNamespace(weight=net.weights.get(key, ORIG), inplace_update=False)
+        net.weights[key] = unet.backup[key].weight + sum(p[0] for p in plist)
+    net.current_uuid = unet.patches_uuid
+
+
+REBAKES = []
+_REBAKE = {"fail": 0}
+
+
+def fake_rebake_keys(patcher, keys):
+    """speed_forge._rebake_keys on the fake weights: backup plus every
+    non-zero payload in the patcher's own lists."""
+    REBAKES.append(list(keys))
+    if _REBAKE["fail"]:
+        _REBAKE["fail"] -= 1
+        raise RuntimeError("rebake failed")
+    done = 0
+    for key in keys:
+        bk = patcher.backup.get(key)
+        if bk is None:
+            continue
+        patcher.model.weights[key] = bk.weight + sum(
+            p[0] for p in patcher.patches.get(key, []) if p[0] != 0.0)
+        done += 1
+    return done
 
 
 def _fake_load_lora_for_models(model, clip, lora, strength_model, strength_clip,
@@ -145,7 +209,13 @@ def _fake_load_lora_for_models(model, clip, lora, strength_model, strength_clip,
             obj = FakeOnlinePatch(filename, key, _PAYLOAD["factory"](strength_model))
             new.weight_wrapper_patches[key] = new.weight_wrapper_patches.get(key, []) + [obj]
         else:
-            new.patches[key] = new.patches.get(key, []) + [(strength_model, "adapter")]
+            adapter = object()
+            if filename == TURBO:
+                _TURBO_ADAPTERS.add(adapter)
+            plist = new.patches.pop(key, [])
+            plist.append(_PAYLOAD["baked"](strength_model, adapter))
+            new.patches[key] = plist
+    new.patches_uuid = next(_UUIDS)
     return new, clip
 
 
@@ -188,6 +258,8 @@ class RecordingSampler:
             "uncond": (extra_args or {}).get("uncond"),
             "total_steps": getattr(model, "total_steps", None),
             "turbo_strengths": [float(o.patch[0][0]) for o in _TURBO_OBJECTS],
+            "weights": dict(_SAMPLING["unet"].model.weights) if _SAMPLING["unet"] else {},
+            "baked_payloads": _baked_turbo_payloads(_SAMPLING["unet"]),
         })
         if self.raise_at_call is not None and len(self.calls) == self.raise_at_call:
             raise RuntimeError("interrupted")
@@ -269,7 +341,7 @@ UI_DEFAULTS = dict(transform="dct", mode="manual", model_preset="flux",
                    sigma_divisor=1.03, manual_sigmas="0.72",
                    spectrum_A=203.615097, spectrum_beta=1.915461, seed=-1,
                    apply_hr=False, diversity_enabled=False, diversity_ref_steps=28,
-                   diversity_cfg=4.5, diversity_pattern="turbo")
+                   diversity_cfg=4.5, diversity_pattern="turbo", diversity_bake=True)
 
 
 def run_before(script, p, enabled=True, seeds=(123,), **overrides):
@@ -280,7 +352,7 @@ def run_before(script, p, enabled=True, seeds=(123,), **overrides):
         ui["scales"], ui["adaptive_delta"], ui["delta"], ui["sigma_divisor"],
         ui["manual_sigmas"], ui["spectrum_A"], ui["spectrum_beta"], ui["seed"],
         ui["apply_hr"], ui["diversity_enabled"], ui["diversity_ref_steps"],
-        ui["diversity_cfg"], ui["diversity_pattern"],
+        ui["diversity_cfg"], ui["diversity_pattern"], ui["diversity_bake"],
         seeds=list(seeds), prompts=["test"], subseeds=[0])
 
 
@@ -313,6 +385,7 @@ class _FakeForgeModel:
     def __init__(self):
         self.original_unet = FakePatcher()
         self.forge_objects = SimpleNamespace(unet=self.original_unet, clip=None)
+        self.forge_objects_after_applying_lora = SimpleNamespace(unet=self.original_unet)
         self.current_lora_hash = "[]"
 
 
@@ -350,15 +423,26 @@ def fake_activate(p, loras, online=False):
         return
     m.current_lora_hash = h
     unet = m.original_unet
+    _TURBO_ADAPTERS.clear()
     for f, s in loras:
         unet, _ = sys.modules["networks"].load_lora_for_models(
             unet, None, LORA_KEYS[f], s, s, filename=f, online_mode=online)
     m.forge_objects.unet = unet
+    m.forge_objects_after_applying_lora = SimpleNamespace(unet=unet)
     _TURBO_OBJECTS[:] = [o for objs in unet.weight_wrapper_patches.values()
                          for o in objs if o.name == TURBO]
 
 # Turbo LoRA patch objects whose strength RecordingSampler records per call.
 _TURBO_OBJECTS = []
+# the unet loaded for sampling in the current fake pass
+_SAMPLING = {"unet": None}
+
+
+def _baked_turbo_payloads(unet):
+    if unet is None:
+        return []
+    return [float(p[0]) for key in sorted(unet.patches) for p in unet.patches[key]
+            if p[1] in _TURBO_ADAPTERS]
 
 
 def make_div_p(sampler_func, model_cls=_FakeKrea2, is_hr_pass=False):
@@ -396,12 +480,25 @@ ORIGINAL_ARGS = {"cond": "cond", "uncond": None, "cond_scale": 1.0,
                  "image_cond": None, "s_min_uncond": 0.0}
 
 
-def run_div_pass(p, sigmas, model=None, seen=None, loras=DEFAULT_LORAS, uc=None, **ui):
-    """Hooks, LoRA activation and one wrapped sampling pass; returns the script."""
-    script = run_hooks(p, loras=loras, uc=uc, **{**DIV_UI, **ui})
+def sample_pass(p, sigmas, model=None, seen=None):
+    """sampler.sample: load the unet about to sample, then run the (wrapped)
+    sampler function."""
+    unet = getattr(getattr(p.sd_model, "forge_objects", None), "unet", None)
+    if isinstance(unet, FakePatcher):
+        fake_model_load(unet)
+        _SAMPLING["unet"] = unet
     p.sampler.func(model, torch.randn(1, 4, 32, 32), sigmas=sigmas,
                    extra_args=ORIGINAL_ARGS, disable=True,
                    callback=None if seen is None else (lambda d: seen.append(d["i"])))
+
+
+def run_div_pass(p, sigmas, model=None, seen=None, loras=DEFAULT_LORAS, uc=None,
+                 after_hooks=None, **ui):
+    """Hooks, LoRA activation and one wrapped sampling pass; returns the script."""
+    script = run_hooks(p, loras=loras, uc=uc, **{**DIV_UI, **ui})
+    if after_hooks is not None:
+        after_hooks(p)
+    sample_pass(p, sigmas, model=model, seen=seen)
     return script
 
 
@@ -431,9 +528,18 @@ class ForgeScriptTestCase(unittest.TestCase):
         _kds_stub.torch = torch
         sys.modules["modules.shared"].opts.skip_early_cond = 0.0
         sys.modules["modules.scripts"].scripts_data = []
+        cls.turbo_baked = []
+        cls.turbo_baked_patterns = None
+        cls.turbo_unbaked = None
         LOADER_CALLS.clear()
+        REBAKES.clear()
+        _REBAKE["fail"] = 0
         _TURBO_OBJECTS.clear()
+        _TURBO_ADAPTERS.clear()
+        _SAMPLING["unet"] = None
         _PAYLOAD["factory"] = _default_payload
+        _PAYLOAD["baked"] = _default_baked
+        speed_forge._rebake_keys = fake_rebake_keys
 
 
 # =============================================================================
@@ -860,9 +966,15 @@ class TestDiversityStandDowns(ForgeScriptTestCase):
 
 
 class TestTurboLoRA(ForgeScriptTestCase):
+    """The on-the-fly route (Bake unchecked)."""
+
     def setUp(self):
         super().setUp()
         self.sigmas = flow_schedule(12)
+        DIV_UI["diversity_bake"] = False
+
+    def tearDown(self):
+        DIV_UI.pop("diversity_bake", None)
 
     def _calls_for(self, filename):
         return [c for c in LOADER_CALLS if c["filename"] == filename]
@@ -988,8 +1100,7 @@ class TestTurboLoRA(ForgeScriptTestCase):
             run_before(script, p, **DIV_UI)
             fake_activate(p, DEFAULT_LORAS, online=True)
             script.process_before_every_sampling(p, uc=None)
-            p.sampler.func(None, torch.randn(1, 4, 32, 32), sigmas=self.sigmas,
-                           extra_args=ORIGINAL_ARGS, disable=True)
+            sample_pass(p, self.sigmas)
         self.assertEqual(fake.calls[0]["turbo_strengths"], [0.0, 0.0])
         self.assertEqual(fake.calls[1]["turbo_strengths"], [0.6, 0.6])
 
@@ -1112,13 +1223,203 @@ class TestTurboLoRA(ForgeScriptTestCase):
         fresh = list(_TURBO_OBJECTS)
         self.assertEqual(len(speed_forge.SpeedForgeScript.turbo_entries), 4)
         script.process_before_every_sampling(p, uc=None)
-        p.sampler.func(None, torch.randn(1, 4, 32, 32), sigmas=self.sigmas,
-                       extra_args=ORIGINAL_ARGS, disable=True)
+        sample_pass(p, self.sigmas)
         self.assertEqual([o.patch[0][0] for o in stale], [0.6, 0.6])
         self.assertEqual([o.patch[0][0] for o in fresh], [0.5, 0.5])
         self.assertEqual(len(speed_forge.SpeedForgeScript.turbo_entries), 2)
         self.assertTrue(p.extra_generation_params["SPEED"].endswith(
-            "lora=krea2_turbo_lora_rank_64_bf16:0.5, coarse=10)"))
+            "lora=krea2_turbo_lora_rank_64_bf16:0.5, switch=online, coarse=10)"))
+
+
+
+class TestTurboLoRABaked(ForgeScriptTestCase):
+    """The default route: Forge's own baked load, two weight rewrites per pass."""
+
+    TURBO_ONLY = "blocks.1.mlp.weight"
+    SHARED = "blocks.0.attn.weight"     # turbo 0.6 + style 0.8
+
+    def setUp(self):
+        super().setUp()
+        self.sigmas = flow_schedule(12)
+
+    def _at(self, call):
+        return (call["weights"].get(self.TURBO_ONLY), call["weights"].get(self.SHARED))
+
+    def test_the_load_is_forges_own(self):
+        p = make_div_p(RecordingSampler())
+        run_div_pass(p, self.sigmas)
+        self.assertEqual([c["online_mode"] for c in LOADER_CALLS], [False, False])
+        unet = p.sd_model.forge_objects.unet
+        self.assertEqual(unet.weight_wrapper_patches, {})
+        self.assertEqual(len(speed_forge.SpeedForgeScript.turbo_baked), 2)
+        self.assertEqual(speed_forge.SpeedForgeScript.turbo_entries, [])
+
+    def test_off_for_coarse_on_for_fine(self):
+        fake = RecordingSampler()
+        p = make_div_p(fake)
+        run_div_pass(p, self.sigmas)
+        coarse, fine = fake.calls
+        self.assertEqual(self._at(coarse), (0.0, 0.8))
+        self.assertEqual(self._at(fine), (0.6, 0.6 + 0.8))
+        # the payloads the lowvram path would read follow the switch too
+        self.assertEqual(coarse["baked_payloads"], [0.0, 0.0])
+        self.assertEqual(fine["baked_payloads"], [0.6, 0.6])
+        self.assertEqual(coarse["cond_scale"], 4.5)
+        self.assertEqual(len(REBAKES), 2)
+        self.assertEqual(sorted(REBAKES[0]), sorted(LORA_KEYS[TURBO]))
+        # back at rest: Forge's own baked state, and no full repatch requested
+        unet = p.sd_model.forge_objects.unet
+        self.assertEqual((unet.model.weights[self.TURBO_ONLY], unet.model.weights[self.SHARED]),
+                         (0.6, 1.4))
+        self.assertEqual(unet.model.current_uuid, unet.patches_uuid)
+        self.assertIsNone(speed_forge.SpeedForgeScript.turbo_unbaked)
+
+    def test_infotext_has_no_switch_tag(self):
+        p = make_div_p(RecordingSampler())
+        run_div_pass(p, self.sigmas)
+        self.assertTrue(p.extra_generation_params["SPEED"].endswith(
+            "lora=krea2_turbo_lora_rank_64_bf16:0.6, coarse=10)"))
+
+    def test_the_unet_that_samples_is_the_one_switched(self):
+        # another script clones the unet after our hook; the clone shares the
+        # model and backups but has its own patch lists
+        fake = RecordingSampler()
+        p = make_div_p(fake)
+        holder = {}
+
+        def clone_unet(p):
+            holder["cached"] = p.sd_model.forge_objects.unet
+            p.sd_model.forge_objects.unet = holder["cached"].clone()
+
+        run_div_pass(p, self.sigmas, after_hooks=clone_unet)
+        self.assertEqual(self._at(fake.calls[0]), (0.0, 0.8))
+        self.assertEqual(fake.calls[0]["baked_payloads"], [0.0, 0.0])
+        cached = holder["cached"]
+        self.assertEqual(sorted(float(p_[0]) for k in cached.patches for p_ in cached.patches[k]),
+                         [0.6, 0.6, 0.8, 0.8])
+
+    def test_interrupted_coarse_segment_rebakes(self):
+        fake = RecordingSampler(raise_at_call=1)
+        p = make_div_p(fake)
+        with self.assertRaises(RuntimeError):
+            run_div_pass(p, self.sigmas)
+        self.assertEqual(self._at(fake.calls[0]), (0.0, 0.8))
+        w = p.sd_model.forge_objects.unet.model.weights
+        self.assertEqual((w[self.TURBO_ONLY], w[self.SHARED]), (0.6, 1.4))
+        self.assertIsNone(speed_forge.SpeedForgeScript.turbo_unbaked)
+
+    def test_postprocess_rebakes_a_pass_left_off(self):
+        p = make_div_p(RecordingSampler())
+        script = run_div_pass(p, self.sigmas)
+        cls = speed_forge.SpeedForgeScript
+        unet = p.sd_model.forge_objects.unet
+        speed_forge._switch_baked(unet, cls.turbo_baked, 0.0)
+        cls.turbo_unbaked = (unet, cls.turbo_baked)
+        self.assertEqual(unet.model.weights[self.TURBO_ONLY], 0.0)
+        script.postprocess(p, None)
+        self.assertEqual(unet.model.weights[self.TURBO_ONLY], 0.6)
+        self.assertIsNone(cls.turbo_unbaked)
+
+    def test_failed_rewrite_restores_and_forces_a_full_repatch(self):
+        _REBAKE["fail"] = 1
+        fake = RecordingSampler()
+        p = make_div_p(fake)
+        with self.assertRaises(RuntimeError):
+            run_div_pass(p, self.sigmas)
+        self.assertEqual(fake.calls, [])          # failed before the coarse call
+        unet = p.sd_model.forge_objects.unet
+        self.assertEqual(_baked_turbo_payloads(unet), [0.6, 0.6])
+        self.assertNotEqual(unet.model.current_uuid, unet.patches_uuid)
+        fake_model_load(unet)                     # the next load rebuilds
+        self.assertEqual(unet.model.weights[self.TURBO_ONLY], 0.6)
+
+    def test_cached_load_keeps_adoption_and_still_switches(self):
+        p = make_div_p(RecordingSampler())
+        run_div_pass(p, self.sigmas).postprocess(p, None)
+        LOADER_CALLS.clear()
+        fake = RecordingSampler()
+        p.sampler.func = fake
+        run_div_pass(p, self.sigmas)
+        self.assertEqual(LOADER_CALLS, [])
+        self.assertEqual(self._at(fake.calls[0]), (0.0, 0.8))
+        self.assertEqual(self._at(fake.calls[1]), (0.6, 1.4))
+
+    def test_lora_hash_only_reloads_when_needed(self):
+        p = make_div_p(RecordingSampler())
+        m = p.sd_model
+
+        def before(**ui):
+            run_before(speed_forge.SpeedForgeScript(), p, **{**DIV_UI, **ui})
+            return m.current_lora_hash
+
+        self.assertIsNone(before())                       # first enable: must see the load
+        fake_activate(p, DEFAULT_LORAS)
+        cached = m.current_lora_hash
+        self.assertEqual(before(), cached)                # unchanged
+        self.assertEqual(before(diversity_enabled=False), cached)   # off keeps Forge's load
+        self.assertEqual(before(), cached)                # back on, payloads still loaded
+        self.assertEqual(before(enabled=False), cached)   # SPEED off
+        self.assertEqual(before(), cached)
+        self.assertIsNone(before(diversity_pattern="lightning"))     # new pattern
+        fake_activate(p, DEFAULT_LORAS)
+        self.assertIsNone(before())                       # back to turbo: not adopted now
+        fake_activate(p, DEFAULT_LORAS)
+        cached = m.current_lora_hash
+        self.assertIsNone(before(diversity_bake=False))   # to on-the-fly: reload
+        fake_activate(p, DEFAULT_LORAS)
+        self.assertIsNone(before())                       # and back: reload
+        fake_activate(p, DEFAULT_LORAS)
+        cached = m.current_lora_hash
+        # a reload while off drops the adoption; switching on reloads again
+        self.assertEqual(before(diversity_enabled=False), cached)
+        m.current_lora_hash = "something else"
+        fake_activate(p, DEFAULT_LORAS)
+        self.assertIsNone(before())
+
+    def test_no_matching_lora_stands_down(self):
+        fake = RecordingSampler()
+        p = make_div_p(fake)
+        run_div_pass(p, self.sigmas, loras=((STYLE, 0.8),))
+        for call in fake.calls:
+            self.assertIs(call["extra_args"], ORIGINAL_ARGS)
+        self.assertEqual(REBAKES, [])
+
+    def test_baked_drift_refused(self):
+        _PAYLOAD["baked"] = lambda s_, a: (s_, a, 1.0, None, None, True)
+        fake = RecordingSampler()
+        p = make_div_p(fake)
+        out, restore = capture_log()
+        try:
+            run_div_pass(p, self.sigmas, loras=((TURBO, 0.6),))
+        finally:
+            restore()
+        self.assertEqual(speed_forge.SpeedForgeScript.turbo_baked, [])
+        self.assertEqual(REBAKES, [])
+        self.assertTrue(any("refusing to drive its patches" in m for m in out), out)
+
+    def test_global_on_the_fly_option_drives_it_online(self):
+        with _fake_backend_args(ref_latents=[]) as args:
+            args.dynamic_args.online_lora = True
+            fake = RecordingSampler()
+            p = make_div_p(fake)
+            script = speed_forge.SpeedForgeScript()
+            run_before(script, p, **DIV_UI)
+            fake_activate(p, DEFAULT_LORAS, online=True)
+            script.process_before_every_sampling(p, uc=None)
+            sample_pass(p, self.sigmas)
+        self.assertEqual(fake.calls[0]["turbo_strengths"], [0.0, 0.0])
+        self.assertEqual(REBAKES, [])
+        self.assertIn("switch=online", p.extra_generation_params["SPEED"])
+
+    def test_flip_times_are_logged(self):
+        out, restore = capture_log()
+        try:
+            run_div_pass(make_div_p(RecordingSampler()), self.sigmas)
+        finally:
+            restore()
+        flips = [m for m in out if "Turbo LoRA off" in m or "Turbo LoRA back on" in m]
+        self.assertEqual(len(flips), 2, out)
+        self.assertIn("2 of 2 weights rewritten", flips[0])
 
 
 
@@ -1334,7 +1635,7 @@ class TestUnlockWiring(ForgeScriptTestCase):
 
     def test_both_checkboxes_push_the_update(self):
         script, components, neg, cfg, started = self._build(False)
-        self.assertEqual(len(components), 17)
+        self.assertEqual(len(components), 18)
         enabled, diversity = components[0], components[13]
         self.assertIsNot(enabled, diversity)
         for checkbox in (enabled, diversity):

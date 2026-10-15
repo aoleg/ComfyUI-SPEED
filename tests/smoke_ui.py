@@ -83,12 +83,13 @@ def build(is_img2img):
             script.after_component(component)
         components = script.ui(is_img2img)
 
-    assert len(components) == 17, f"expected 17 components, got {len(components)}"
+    assert len(components) == 18, f"expected 18 components, got {len(components)}"
     enabled, diversity = components[0], components[13]
-    ref_steps, raw_cfg, pattern = components[14:17]
+    ref_steps, raw_cfg, pattern, bake = components[14:18]
     assert (ref_steps.minimum, ref_steps.maximum, ref_steps.value) == (28, 52, 28)
     assert (raw_cfg.minimum, raw_cfg.maximum, raw_cfg.value) == (1.0, 10.0, 4.5)
     assert pattern.value == "turbo"
+    assert bake.value is True
 
     pushes = []
     for fn in demo.fns.values() if isinstance(demo.fns, dict) else demo.fns:
