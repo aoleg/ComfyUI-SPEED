@@ -13,6 +13,12 @@ sampler function (the math is shared with the ComfyUI node via
 
 Designed for flow-matching models (Flux, Wan, ...) whose sigmas live in
 (0, 1]; eps-prediction models (SD1.x/SDXL) run but are unvalidated.
+
+The "RAW composition stage" subsection (Forge Neo only, see
+docs/krea2-hybrid-plan.md) passes a ``segment_hook`` into the shared core:
+coarse segments get the encoded negative prompt, a real CFG scale and the
+step density of a RAW reference schedule; fine segments get Forge's own
+``extra_args`` untouched.
 """
 from __future__ import annotations
 
@@ -129,6 +135,186 @@ def _anima_reference_latents_active(p) -> bool:
     return bool(getattr(dynamic_args, "ref_latents", None))
 
 
+# =============================================================================
+# RAW composition stage ("diversity" subsection)
+# =============================================================================
+
+# Model class name -> experimental. Krea 2 is the tested target; Z-Image and
+# FLUX.2 Klein have community Turbo LoRAs and run uncalibrated.
+DIVERSITY_MODELS = {"Krea2": False, "ZImage": True, "Flux2": True}
+
+# Tolerance for "this sigma is on the reference schedule". Schedules are float32.
+_SIGMA_TOL = 1e-4
+
+
+def _parse_patterns(text) -> tuple:
+    """Comma-separated, case-insensitive filename substrings."""
+    return tuple(t.strip().lower() for t in str(text or "").split(",") if t.strip())
+
+
+def _redensify(seg_sigmas, reference, anchor):
+    """Replace one coarse segment's sigmas with the reference schedule's.
+
+    ``reference`` is the RAW reference schedule (floats, descending).
+    ``anchor`` is ``None`` for the first coarse segment, whose start must then
+    be on the reference schedule (a txt2img run starts at sigma_max on both);
+    for a later coarse segment it is the previous segment's unpatched end,
+    because this segment starts at SPEED's aligned ``t_tilde``, which is on no
+    schedule. The segment keeps its own first and last sigma; in between go
+    the reference entries strictly inside its bounds.
+
+    Returns ``(sigmas, None)`` or ``(None, reason)``.
+    """
+    first, last = float(seg_sigmas[0]), float(seg_sigmas[-1])
+    if anchor is None:
+        if not any(abs(r - first) <= _SIGMA_TOL for r in reference):
+            return None, (f"segment starts at sigma {first:.4f}, which is not on the "
+                          f"{len(reference) - 1}-step reference schedule (img2img or a "
+                          "mid-schedule start); keeping this segment's own steps")
+        anchor = first
+    upper = min(first, anchor)
+    values = ([first]
+              + [r for r in reference if last + _SIGMA_TOL < r < upper - _SIGMA_TOL]
+              + [last])
+    if len(values) < 2 or any(b >= a for a, b in zip(values, values[1:])):
+        return None, ("reference slice is not strictly decreasing; keeping this "
+                      "segment's own steps")
+    return torch.tensor(values, dtype=seg_sigmas.dtype, device=seg_sigmas.device), None
+
+
+def _make_index_map(orig_len: int, new_len: int):
+    """Map a callback index of the re-densified segment onto the original
+    segment's range, forwarding only the first call per original index, so the
+    progress bar and Forge's step counters see one callback per original step."""
+    last = [-1]
+
+    def index_map(j):
+        i = min(j * orig_len // new_len, orig_len - 1)
+        if i <= last[0]:
+            return None
+        last[0] = i
+        return i
+
+    return index_map
+
+
+def _encode_negative(p):
+    """The unconditional at CFG 1, through the same call ``setup_conds``
+    (modules/processing.py) makes in its CFG > 1 branch, and so through Forge's
+    own ``cached_uc``: a batch encodes once, and the result is the scheduled
+    list ``reconstruct_cond_batch`` indexes by step."""
+    from modules import prompt_parser
+    negative_prompts = prompt_parser.SdConditioning(
+        p.negative_prompts, width=p.width, height=p.height, is_negative_prompt=True,
+        distilled_cfg_scale=p.distilled_cfg_scale)
+    return p.get_conds_with_caching(
+        prompt_parser.get_learned_conditioning, negative_prompts, p.firstpass_steps,
+        [p.cached_uc], p.extra_network_data)
+
+
+def _guidance_overrides_note(p) -> str | None:
+    """Denoiser options that can force the scale back to 1.0 after the wrapper
+    set it (sd_samplers_cfg_denoiser.py): Skip Early CFG and NGMS."""
+    try:
+        from modules.shared import opts
+        skip_early = float(getattr(opts, "skip_early_cond", 0.0) or 0.0)
+    except Exception:
+        skip_early = 0.0
+    ngms = float(getattr(p, "s_min_uncond", 0.0) or 0.0)
+    notes = []
+    if skip_early > 0.0:
+        notes.append(f"Skip Early CFG = {skip_early:g}")
+    if ngms > 0.0:
+        notes.append(f"NGMS = {ngms:g}")
+    if not notes:
+        return None
+    return (" and ".join(notes) + " is set; it can drop the RAW CFG back to 1.0 "
+            "on some coarse steps")
+
+
+def _make_diversity_hook(div: dict, model, schedule_end: float, run: dict):
+    """Build the ``segment_hook`` for one sampling pass.
+
+    ``div`` is the per-pass runtime built in ``process_before_every_sampling``
+    (``uc``, ``cfg``, ``reference``); ``run`` collects what happened, for the
+    restore and the summary in ``_finish_diversity``.
+    """
+    prev_end = [None]
+
+    def hook(seg_index, scale, seg_sigmas, extra_args):
+        coarse = scale < 1.0 - 1e-6
+        if coarse and abs(float(seg_sigmas[-1]) - schedule_end) <= 1e-9:
+            # No transition follows: SPEED is running the rest of the schedule
+            # at reduced resolution. The full-resolution stage this feature
+            # hands off to never comes, so it stands down for the segment.
+            if not run.get("no_transition_logged"):
+                run["no_transition_logged"] = True
+                _log("diversity: no full-resolution segment follows; RAW stage not "
+                     "applied to this pass")
+            return seg_sigmas, extra_args, None
+        if not coarse:
+            run["fine_segments"] = run.get("fine_segments", 0) + 1
+            return seg_sigmas, extra_args, None
+
+        anchor = prev_end[0]
+        prev_end[0] = float(seg_sigmas[-1])
+        orig_len = len(seg_sigmas) - 1
+        new_sigmas, reason = _redensify(seg_sigmas, div["reference"], anchor)
+        index_map = None
+        if new_sigmas is None:
+            _log(f"diversity: {reason}")
+            new_sigmas = seg_sigmas
+        else:
+            new_len = len(new_sigmas) - 1
+            if new_len != orig_len:
+                index_map = _make_index_map(orig_len, new_len)
+            if new_len < orig_len:
+                _log(f"diversity: the {len(div['reference']) - 1}-step reference is "
+                     f"sparser than this run here ({new_len} vs {orig_len} steps)")
+            _bump_total_steps(model, new_len - orig_len, run)
+        new_len = len(new_sigmas) - 1
+
+        seg_args = dict(extra_args)
+        seg_args["uncond"] = div["uc"]
+        seg_args["cond_scale"] = div["cfg"]
+
+        run["coarse_segments"] = run.get("coarse_segments", 0) + 1
+        run["coarse_steps"] = run.get("coarse_steps", 0) + new_len
+        _log(f"diversity: coarse segment {seg_index} at scale {scale:g}: {orig_len} -> "
+             f"{new_len} steps, sigma {float(new_sigmas[0]):.4f}->"
+             f"{float(new_sigmas[-1]):.4f}, CFG {div['cfg']:g}")
+        return new_sigmas, seg_args, index_map
+
+    return hook
+
+
+def _bump_total_steps(model, extra_steps: int, run: dict):
+    """``CFGDenoiser.total_steps`` is compared with its per-call ``step`` for
+    Skip Early CFG, NGMS parity and the refiner switch; add the extra calls a
+    re-densified segment makes. Restored by ``_finish_diversity``."""
+    total = getattr(model, "total_steps", None)
+    if not isinstance(total, int) or extra_steps == 0:
+        return
+    if "total_steps_backup" not in run:
+        run["total_steps_backup"] = total
+    steps = getattr(model, "steps", None)
+    mult = max(1, round(total / steps)) if isinstance(steps, int) and steps > 0 else 1
+    model.total_steps = max(1, total + extra_steps * mult)
+
+
+def _finish_diversity(div: dict, model, run: dict):
+    """Undo the pass-scoped changes. Runs on success and on interruption."""
+    if "total_steps_backup" in run and model is not None:
+        model.total_steps = run["total_steps_backup"]
+
+
+def _diversity_infotext(div: dict, run: dict) -> str:
+    parts = [f"ref={div['ref_steps']}", f"cfg={div['cfg']:g}"]
+    parts.append(f"coarse={run.get('coarse_steps', 0)}")
+    return (f"diversity({', '.join(parts)})"
+            + (" experimental" if div.get("experimental") else ""))
+
+
 def _make_speed_func(base_fn, cfg: dict):
     """Wrap a k-diffusion ``sample_*`` function with SPEED segmentation."""
 
@@ -158,6 +344,12 @@ def _make_speed_func(base_fn, cfg: dict):
              f"mode={cfg['mode_label']}, transform={cfg['transform']}, "
              f"scales={cfg['scales']}, seed={cfg['seed']}")
 
+        div = cfg.get("diversity")
+        hook = None
+        run = {}
+        if div is not None:
+            hook = _make_diversity_hook(div, model, float(sigmas[-1]), run)
+
         import k_diffusion.sampling as kds
         prev_torch = kds.torch
         kds.torch = _ShapeSafeRandn(prev_torch, cfg["seed"])
@@ -172,10 +364,21 @@ def _make_speed_func(base_fn, cfg: dict):
                 adaptive_delta=cfg["adaptive_delta"], ref_latent=cfg["ref_latent"],
                 ref_shift=cfg["ref_shift"], sigma_divisor=cfg["sigma_divisor"],
                 sampler_kwargs=kwargs, full_res_sampler_kwargs=full_res_kwargs,
-                log_fn=_log,
+                log_fn=_log, segment_hook=hook,
             )
         finally:
             kds.torch = prev_torch
+            if div is not None:
+                _finish_diversity(div, model, run)
+
+        if div is not None:
+            if run.get("coarse_segments"):
+                p = div["p"]
+                p.extra_generation_params["SPEED"] = (
+                    f"{div['infotext_base']} {_diversity_infotext(div, run)}")
+            elif not run.get("no_transition_logged"):
+                _log("diversity: no coarse segment ran in this pass (it starts below "
+                     "the transition sigma); RAW stage not applied")
 
         SpeedForgeScript.completed_passes += 1
         return result
@@ -192,6 +395,9 @@ class SpeedForgeScript(scripts.Script):
     apply_hr: bool = False
     wrapped_passes: int = 0
     completed_passes: int = 0
+    # RAW composition stage: settings for this run when it is active (feature
+    # on, SPEED on, supported model), else None.
+    diversity: dict | None = None
 
     def title(self):
         return "SPEED (Spectral Progressive Diffusion)"
@@ -292,21 +498,82 @@ class SpeedForgeScript(scripts.Script):
                 value=False, label="Apply to hires-fix pass (experimental)",
                 visible=not is_img2img,
             )
+            with InputAccordion(False, label="Diversity: RAW composition stage (Krea 2)") \
+                    as diversity_enabled:
+                gr.Markdown(
+                    "For a RAW checkpoint with a Turbo LoRA in the prompt. While SPEED "
+                    "runs its reduced-resolution steps, the Turbo LoRA is held at "
+                    "strength 0, the negative prompt is applied with real CFG, and "
+                    "those steps run at the density the RAW model expects. From the "
+                    "first full-resolution step on, the Turbo LoRA returns at its "
+                    "prompt strength and sampling continues at the main CFG. Stands "
+                    "down when no prompt LoRA matches the pattern. Tested on Krea 2; "
+                    "Z-Image and FLUX.2 Klein run as experimental. Step-scheduled "
+                    "prompt syntax shifts its switch points while this is on."
+                )
+                with gr.Row():
+                    diversity_ref_steps = gr.Slider(
+                        minimum=28, maximum=52, step=1, value=28, label="Reference steps",
+                        info="Steps the RAW model would run on its own (28 = diffusers "
+                             "default, 52 = official repo). Only the part above SPEED's "
+                             "transition sigma runs.",
+                    )
+                    diversity_cfg = gr.Slider(
+                        minimum=1.0, maximum=10.0, step=0.5, value=4.5, label="RAW CFG",
+                        info="CFG for the reduced-resolution steps, standard convention "
+                             "(4.5 here equals Krea's 3.5).",
+                    )
+                    diversity_pattern = gr.Textbox(
+                        value="turbo", label="Turbo LoRA pattern",
+                        info="Comma-separated, case-insensitive filename substrings. "
+                             "Only matching prompt LoRAs are switched; all others keep "
+                             "their prompt strength.",
+                    )
 
         return [enabled, transform, mode, model_preset, scales, adaptive_delta,
                 delta, sigma_divisor, manual_sigmas, spectrum_A, spectrum_beta,
-                seed, apply_hr]
+                seed, apply_hr, diversity_enabled, diversity_ref_steps,
+                diversity_cfg, diversity_pattern]
+
+    @staticmethod
+    def _resolve_diversity(p, enabled, ref_steps, raw_cfg, pattern):
+        """Settings dict for this run, or None (feature off or standing down)."""
+        if not enabled:
+            return None
+        model_class = type(getattr(p, "sd_model", None)).__name__
+        if model_class not in DIVERSITY_MODELS:
+            _log(f"diversity: RAW composition stage is for Krea 2 (and, experimental, "
+                 f"Z-Image / FLUX.2 Klein); this model is {model_class}, standing down.")
+            return None
+        patterns = _parse_patterns(pattern)
+        if not patterns:
+            _log("diversity: Turbo LoRA pattern is empty; standing down.")
+            return None
+        experimental = DIVERSITY_MODELS[model_class]
+        if experimental:
+            _log(f"diversity: RAW composition stage on {model_class} is experimental "
+                 "(uncalibrated; tested on Krea 2 only).")
+        return {
+            "ref_steps": int(ref_steps),
+            "cfg": float(raw_cfg),
+            "patterns": patterns,
+            "experimental": experimental,
+            "model_class": model_class,
+        }
 
     def before_process_batch(self, p, enabled, transform, mode, model_preset,
                              scales, adaptive_delta, delta, sigma_divisor,
                              manual_sigmas, spectrum_A, spectrum_beta, seed,
-                             apply_hr, *args, **kwargs):
+                             apply_hr, diversity_enabled=False, diversity_ref_steps=28,
+                             diversity_cfg=4.5, diversity_pattern="turbo",
+                             *args, **kwargs):
         cls = SpeedForgeScript
         cls.enabled = bool(enabled)
         cls.config = None
         cls.apply_hr = bool(apply_hr)
         cls.wrapped_passes = 0
         cls.completed_passes = 0
+        cls.diversity = None
         if not cls.enabled:
             return
 
@@ -367,6 +634,43 @@ class SpeedForgeScript(scripts.Script):
             + f"seed={seed}"
         )
 
+        cls.diversity = self._resolve_diversity(
+            p, diversity_enabled, diversity_ref_steps, diversity_cfg, diversity_pattern)
+
+    @staticmethod
+    def _diversity_runtime(p, div: dict, uc):
+        """Per-pass state for the segment hook, or None to stand down this pass.
+
+        Built here rather than inside the sampler wrapper because both calls
+        must happen outside sampling: the encode goes through Forge's cond
+        cache, and ``get_sigmas`` is wrapped by other extensions (Neo-LoraCtl
+        captures the schedule from it), so calling it during the pass would
+        overwrite what they captured for the real schedule.
+        """
+        if uc is None:
+            try:
+                uc = _encode_negative(p)
+            except Exception as e:
+                _log(f"diversity: could not encode the negative prompt ({e}); RAW stage "
+                     "skipped for this pass.")
+                return None
+        try:
+            reference = [float(s) for s in p.sampler.get_sigmas(p, div["ref_steps"])]
+        except Exception as e:
+            _log(f"diversity: could not build the {div['ref_steps']}-step reference "
+                 f"schedule ({e}); RAW stage skipped for this pass.")
+            return None
+        note = _guidance_overrides_note(p)
+        if note:
+            _log(f"diversity: {note}.")
+        return {
+            **div,
+            "uc": uc,
+            "reference": reference,
+            "p": p,
+            "infotext_base": p.extra_generation_params.get("SPEED", ""),
+        }
+
     def process_before_every_sampling(self, p, *args, **kwargs):
         cls = SpeedForgeScript
         if not cls.enabled or cls.config is None:
@@ -395,7 +699,11 @@ class SpeedForgeScript(scripts.Script):
         if getattr(sampler.func, "_speed_wrapped", False):
             return
 
-        sampler.func = _make_speed_func(sampler.func, dict(cls.config))
+        pass_cfg = dict(cls.config)
+        if cls.diversity is not None and not getattr(p, "is_hr_pass", False):
+            pass_cfg["diversity"] = self._diversity_runtime(p, cls.diversity, kwargs.get("uc"))
+
+        sampler.func = _make_speed_func(sampler.func, pass_cfg)
         cls.wrapped_passes += 1
 
     def postprocess(self, p, processed, *args):
@@ -411,3 +719,4 @@ class SpeedForgeScript(scripts.Script):
         cls.apply_hr = False
         cls.wrapped_passes = 0
         cls.completed_passes = 0
+        cls.diversity = None
