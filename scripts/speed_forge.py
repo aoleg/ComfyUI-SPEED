@@ -152,6 +152,187 @@ def _parse_patterns(text) -> tuple:
     return tuple(t.strip().lower() for t in str(text or "").split(",") if t.strip())
 
 
+# --- Turbo LoRA: per-file online routing -------------------------------------
+#
+# Forge bakes prompt LoRAs into the weights at extra_networks.activate through
+# networks.load_lora_for_models. Loaded with online_mode=True instead, each
+# patch becomes an OnlineLoRAPatch in the patcher's weight_wrapper_patches,
+# re-applied on every module forward from its mutable payload, so writing
+# ``obj.patch[0][0]`` changes the next model call. That is what Forge's own
+# LoRA Control Integrated does per step; this routes only the files matching
+# the Turbo pattern (the way Neo-LoraCtl intercepts the loader) and drives
+# their strength per segment. Every other LoRA reaches the stock loader with
+# its original arguments.
+
+_original_load_lora_for_models = None
+
+# [strength, adapter, strength_model, offset, function] (backend/patcher/base.py)
+_PATCH_PAYLOAD_LEN = 5
+
+
+def _lora_matches(filename, patterns) -> bool:
+    base = os.path.splitext(os.path.basename(str(filename)))[0].lower()
+    return any(pat in base for pat in patterns)
+
+
+def _lora_label(filename) -> str:
+    return os.path.splitext(os.path.basename(str(filename)))[0]
+
+
+def _null_lora_hash(p):
+    """Make the stock loader rebuild prompt LoRAs on the next activation."""
+    models = [getattr(p, "sd_model", None)]
+    try:
+        from modules import shared
+        models.append(getattr(shared, "sd_model", None))
+    except ImportError:
+        pass
+    for model in models:
+        if model is not None and hasattr(model, "current_lora_hash"):
+            model.current_lora_hash = None
+
+
+def _install_lora_interception() -> bool:
+    global _original_load_lora_for_models
+    if _original_load_lora_for_models is not None:
+        return True
+    try:
+        import networks
+    except ImportError:
+        _log("diversity: Forge's builtin LoRA module ('networks') is not importable; "
+             "the RAW composition stage cannot switch the Turbo LoRA.")
+        return False
+    _original_load_lora_for_models = networks.load_lora_for_models
+    networks.load_lora_for_models = _intercepted_load_lora_for_models
+    return True
+
+
+def _validate_patch_object(obj) -> str | None:
+    """Error string if ``obj`` does not look like the OnlineLoRAPatch this was
+    written against (same check as Neo-LoraCtl's), else None."""
+    patch = getattr(obj, "patch", None)
+    if not isinstance(patch, list) or len(patch) < 1:
+        return f"patch object has no 1+-element .patch list: {type(obj).__name__}"
+    entry = patch[0]
+    if not isinstance(entry, (tuple, list)) or len(entry) != _PATCH_PAYLOAD_LEN:
+        got = len(entry) if isinstance(entry, (tuple, list)) else type(entry).__name__
+        return f"patch payload arity mismatch: expected {_PATCH_PAYLOAD_LEN}, got {got}"
+    if not isinstance(entry[0], (int, float)) or isinstance(entry[0], bool):
+        return f"patch strength is not a number: {type(entry[0]).__name__}"
+    if not callable(obj):
+        return f"patch object is not callable: {type(obj).__name__}"
+    return None
+
+
+def _set_patch_strength(obj, strength: float):
+    entry = obj.patch[0]
+    if isinstance(entry, list):
+        entry[0] = strength
+    else:
+        obj.patch[0] = (strength,) + tuple(entry[1:])
+
+
+def _set_turbo_strength(entries, scale: float):
+    """Write ``base * scale`` into every adopted Turbo payload."""
+    for obj, base, _label in entries:
+        _set_patch_strength(obj, base * scale)
+
+
+def _global_online_lora() -> bool:
+    try:
+        from backend.args import dynamic_args
+    except ImportError:
+        return False
+    return bool(getattr(dynamic_args, "online_lora", False))
+
+
+def _turbo_owner(filename, online_mode) -> str | None:
+    """Why another writer already owns this file's patch strengths, or None.
+
+    Two writers on ``patch[0][0]`` would fight every step, so the feature
+    stands down rather than share: Forge's builtin LoRA Control (its
+    ``<lora:name:[a:b]>`` mapping, keyed by filename), Neo-LoraCtl when its
+    filter schedules this file (its default filter excludes accelerator
+    LoRAs), or any outer interceptor that already asked for online loading
+    while the global on-the-fly option is off.
+    """
+    for data in getattr(scripts, "scripts_data", None) or []:
+        script_class = getattr(data, "script_class", None)
+        name = getattr(script_class, "__name__", "")
+        if name == "LoRAControl" and filename in (getattr(script_class, "mapping", None) or {}):
+            return "Forge's LoRA Control Integrated schedules it (<lora:...:[a:b]> syntax)"
+        if name == "NeoLoraCtlScript" and getattr(script_class, "enabled", False):
+            loractl_core = sys.modules.get("neo_loractl_core")
+            check = getattr(loractl_core, "lora_is_scheduled", None)
+            try:
+                scheduled = check is not None and check(
+                    filename, list(getattr(script_class, "patterns", []) or []),
+                    getattr(script_class, "filter_mode", "exclude"))
+            except Exception:
+                scheduled = False
+            if scheduled:
+                return "Neo-LoraCtl schedules it (its filter includes this file)"
+    if online_mode and not _global_online_lora():
+        return "another extension already loads it on the fly"
+    return None
+
+
+def _intercepted_load_lora_for_models(model, clip, lora, strength_model, strength_clip,
+                                      filename="default", online_mode=False):
+    cls = SpeedForgeScript
+    if cls.turbo_route is not None and not cls.turbo_cycle_open:
+        # First load call of a fresh activation: the stock loader has just
+        # reset forge_objects to the originals, so prior adoptions are stale.
+        cls.turbo_cycle_open = True
+        cls.turbo_entries = []
+        cls.turbo_blockers = []
+    if (cls.turbo_route is None or model is None
+            or not _lora_matches(filename, cls.turbo_route)):
+        return _original_load_lora_for_models(model, clip, lora, strength_model,
+                                              strength_clip, filename, online_mode)
+
+    label = _lora_label(filename)
+    owner = _turbo_owner(filename, online_mode)
+    if owner is not None:
+        cls.turbo_blockers.append(f"'{label}': {owner}")
+        return _original_load_lora_for_models(model, clip, lora, strength_model,
+                                              strength_clip, filename, online_mode)
+
+    wrappers_before = getattr(model, "weight_wrapper_patches", None)
+    before = {k: len(v) for k, v in (wrappers_before or {}).items()}
+    result = _original_load_lora_for_models(model, clip, lora, strength_model,
+                                            strength_clip, filename, True)
+    if result is None:
+        return result
+    new_model = result[0]
+    wrappers = getattr(new_model, "weight_wrapper_patches", None)
+    if wrappers_before is None or wrappers is None:
+        cls.turbo_blockers.append(f"'{label}': the model has no weight_wrapper_patches "
+                                  "(Forge API drift?)")
+        return result
+
+    adopted, errors = [], []
+    for key, objs in wrappers.items():
+        for obj in objs[before.get(key, 0):]:
+            err = _validate_patch_object(obj)
+            if err is not None:
+                errors.append(f"{key}: {err}")
+            else:
+                adopted.append((obj, float(obj.patch[0][0]), label))
+    if errors:
+        # The LoRA stays online at its prompt strength: the same output as a
+        # plain <lora:> tag, applied on the fly. The feature stands down.
+        cls.turbo_blockers.append(f"'{label}': refusing to drive its patches (Forge API "
+                                  f"drift?): {errors[0]}"
+                                  + (f" (+{len(errors) - 1} more)" if len(errors) > 1 else ""))
+        return result
+    if not adopted:
+        _log(f"diversity: Turbo LoRA '{label}' added no patches to this model.")
+        return result
+    cls.turbo_entries.extend(adopted)
+    return result
+
+
 def _redensify(seg_sigmas, reference, anchor):
     """Replace one coarse segment's sigmas with the reference schedule's.
 
@@ -251,8 +432,11 @@ def _make_diversity_hook(div: dict, model, schedule_end: float, run: dict):
                 run["no_transition_logged"] = True
                 _log("diversity: no full-resolution segment follows; RAW stage not "
                      "applied to this pass")
+            _set_turbo_strength(div["entries"], 1.0)
             return seg_sigmas, extra_args, None
         if not coarse:
+            # Turbo LoRA back at the prompt strength before the first fine call.
+            _set_turbo_strength(div["entries"], 1.0)
             run["fine_segments"] = run.get("fine_segments", 0) + 1
             return seg_sigmas, extra_args, None
 
@@ -277,6 +461,7 @@ def _make_diversity_hook(div: dict, model, schedule_end: float, run: dict):
         seg_args = dict(extra_args)
         seg_args["uncond"] = div["uc"]
         seg_args["cond_scale"] = div["cfg"]
+        _set_turbo_strength(div["entries"], 0.0)
 
         run["coarse_segments"] = run.get("coarse_segments", 0) + 1
         run["coarse_steps"] = run.get("coarse_steps", 0) + new_len
@@ -303,13 +488,17 @@ def _bump_total_steps(model, extra_steps: int, run: dict):
 
 
 def _finish_diversity(div: dict, model, run: dict):
-    """Undo the pass-scoped changes. Runs on success and on interruption."""
+    """Undo the pass-scoped changes. Runs on success and on interruption, so
+    an interrupted coarse segment does not leave the Turbo LoRA at 0."""
+    _set_turbo_strength(div["entries"], 1.0)
     if "total_steps_backup" in run and model is not None:
         model.total_steps = run["total_steps_backup"]
 
 
 def _diversity_infotext(div: dict, run: dict) -> str:
     parts = [f"ref={div['ref_steps']}", f"cfg={div['cfg']:g}"]
+    if div.get("lora_label"):
+        parts.append(f"lora={div['lora_label']}")
     parts.append(f"coarse={run.get('coarse_steps', 0)}")
     return (f"diversity({', '.join(parts)})"
             + (" experimental" if div.get("experimental") else ""))
@@ -398,6 +587,18 @@ class SpeedForgeScript(scripts.Script):
     # RAW composition stage: settings for this run when it is active (feature
     # on, SPEED on, supported model), else None.
     diversity: dict | None = None
+    # Turbo LoRA routing. ``turbo_route`` is the pattern tuple the loader
+    # interception routes online this run (None = pass everything through);
+    # ``turbo_membership`` is the route of the last run, to null the stock
+    # loader's hash only when it changes. Adopted entries are (OnlineLoRAPatch,
+    # base strength) and deliberately persist across runs: the stock loader
+    # reuses its LoRA application while its hash is unchanged, and so do the
+    # live objects. Staleness is checked against the live unet per pass.
+    turbo_route: tuple | None = None
+    turbo_membership: tuple | None = None
+    turbo_cycle_open: bool = False
+    turbo_entries: list = []      # (OnlineLoRAPatch, base strength, LoRA name)
+    turbo_blockers: list = []
 
     def title(self):
         return "SPEED (Spectral Progressive Diffusion)"
@@ -561,12 +762,48 @@ class SpeedForgeScript(scripts.Script):
             "model_class": model_class,
         }
 
-    def before_process_batch(self, p, enabled, transform, mode, model_preset,
-                             scales, adaptive_delta, delta, sigma_divisor,
-                             manual_sigmas, spectrum_A, spectrum_beta, seed,
-                             apply_hr, diversity_enabled=False, diversity_ref_steps=28,
-                             diversity_cfg=4.5, diversity_pattern="turbo",
-                             *args, **kwargs):
+    def before_process_batch(self, p, *args, **kwargs):
+        # Runs before extra_networks.activate (modules/processing.py), which is
+        # where the Turbo LoRA gets loaded, so the route set here is the one
+        # the loader interception sees for this batch.
+        self._configure_run(p, *args, **kwargs)
+        self._update_turbo_route(p)
+
+    @staticmethod
+    def _update_turbo_route(p):
+        cls = SpeedForgeScript
+        cls.turbo_cycle_open = False
+        route = cls.diversity["patterns"] if cls.diversity is not None else None
+        if route is not None and not _install_lora_interception():
+            cls.diversity = None
+            route = None
+        cls.turbo_route = route
+        if route != cls.turbo_membership:
+            # The route decides how the Turbo LoRA is loaded (online or baked)
+            # but is not part of the stock loader's hash, so a change has to
+            # force the reload. Unchanged, the loader's cache stays valid.
+            cls.turbo_membership = route
+            cls.turbo_entries = []
+            cls.turbo_blockers = []
+            _null_lora_hash(p)
+
+    @staticmethod
+    def _live_turbo_entries(p):
+        """Adopted entries whose objects are in the unet about to sample."""
+        unet = getattr(getattr(getattr(p, "sd_model", None), "forge_objects", None),
+                       "unet", None)
+        wrappers = getattr(unet, "weight_wrapper_patches", None)
+        if not wrappers:
+            return []
+        live = {id(obj) for objs in wrappers.values() for obj in objs}
+        return [e for e in SpeedForgeScript.turbo_entries if id(e[0]) in live]
+
+    def _configure_run(self, p, enabled, transform, mode, model_preset,
+                       scales, adaptive_delta, delta, sigma_divisor,
+                       manual_sigmas, spectrum_A, spectrum_beta, seed,
+                       apply_hr, diversity_enabled=False, diversity_ref_steps=28,
+                       diversity_cfg=4.5, diversity_pattern="turbo",
+                       *args, **kwargs):
         cls = SpeedForgeScript
         cls.enabled = bool(enabled)
         cls.config = None
@@ -647,6 +884,19 @@ class SpeedForgeScript(scripts.Script):
         captures the schedule from it), so calling it during the pass would
         overwrite what they captured for the real schedule.
         """
+        cls = SpeedForgeScript
+        if cls.turbo_blockers:
+            _log("diversity: Turbo LoRA " + "; ".join(cls.turbo_blockers)
+                 + ". RAW composition stage skipped for this run.")
+            return None
+        entries = cls._live_turbo_entries(p)
+        cls.turbo_entries = entries
+        if not entries:
+            _log(f"diversity: no prompt LoRA matches the Turbo pattern "
+                 f"'{', '.join(div['patterns'])}'; RAW composition stage skipped for "
+                 "this run (it needs a Turbo LoRA to switch off).")
+            return None
+
         if uc is None:
             try:
                 uc = _encode_negative(p)
@@ -667,6 +917,9 @@ class SpeedForgeScript(scripts.Script):
             **div,
             "uc": uc,
             "reference": reference,
+            "entries": entries,
+            "lora_label": "+".join(f"{name}:{base:g}" for name, base in
+                                   dict.fromkeys((e[2], e[1]) for e in entries)),
             "p": p,
             "infotext_base": p.extra_generation_params.get("SPEED", ""),
         }
@@ -714,6 +967,11 @@ class SpeedForgeScript(scripts.Script):
             elif cls.completed_passes == 0:
                 _log("sampler was wrapped but the SPEED function never ran; "
                      "check the console for earlier errors.")
+        # Park the Turbo LoRA at its prompt strength between generations. The
+        # wrapper already does this per pass; this covers a run that ended
+        # some other way. Entries persist (see the class attributes).
+        _set_turbo_strength(cls.turbo_entries, 1.0)
+        cls.turbo_cycle_open = False
         cls.enabled = False
         cls.config = None
         cls.apply_hr = False

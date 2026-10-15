@@ -37,6 +37,7 @@ def _install_stubs():
     scripts_stub.Script = _Script
     scripts_stub.AlwaysVisible = object()
     scripts_stub.basedir = lambda: str(_ROOT)
+    scripts_stub.scripts_data = []
 
     errors_stub = types.ModuleType("modules.errors")
     errors_stub.report = lambda msg, **kw: _reported_errors.append(msg)
@@ -56,6 +57,7 @@ def _install_stubs():
 
     shared_stub = types.ModuleType("modules.shared")
     shared_stub.opts = SimpleNamespace(skip_early_cond=0.0)
+    shared_stub.sd_model = None
 
     modules_stub = types.ModuleType("modules")
     modules_stub.scripts = scripts_stub
@@ -78,7 +80,65 @@ def _install_stubs():
     sys.modules["modules.shared"] = shared_stub
     sys.modules["k_diffusion"] = k_diffusion_stub
     sys.modules["k_diffusion.sampling"] = kds_stub
+
+    networks_stub = types.ModuleType("networks")
+    networks_stub.load_lora_for_models = _fake_load_lora_for_models
+    sys.modules["networks"] = networks_stub
     return kds_stub
+
+
+# --- fake Forge LoRA loader (extensions-builtin/sd_forge_lora/networks.py) ----
+
+LOADER_CALLS = []
+
+
+def _default_payload(strength):
+    # [strength, adapter, strength_model, offset, function], a mutable list as
+    # on current Forge Neo (backend/patcher/base.py add_patches)
+    return [strength, "adapter", 1.0, None, None]
+
+
+_PAYLOAD = {"factory": _default_payload}
+
+
+class FakeOnlinePatch:
+    def __init__(self, name, key, payload):
+        self.name = name
+        self.key = key
+        self.patch = [payload]
+
+    def __call__(self, weight):
+        return weight
+
+
+class FakePatcher:
+    """ModelPatcher's clone semantics: the wrapper dict is copied, its lists
+    are rebound (not mutated) when a wrapper is added."""
+
+    def __init__(self):
+        self.weight_wrapper_patches = {}
+        self.patches = {}
+
+    def clone(self):
+        n = FakePatcher()
+        n.weight_wrapper_patches = self.weight_wrapper_patches.copy()
+        n.patches = {k: v[:] for k, v in self.patches.items()}
+        return n
+
+
+def _fake_load_lora_for_models(model, clip, lora, strength_model, strength_clip,
+                               filename="default", online_mode=False):
+    LOADER_CALLS.append(dict(filename=filename, strength_model=strength_model,
+                             strength_clip=strength_clip, online_mode=online_mode,
+                             model=model, clip=clip, lora=lora))
+    new = model.clone()
+    for key in lora:
+        if online_mode:
+            obj = FakeOnlinePatch(filename, key, _PAYLOAD["factory"](strength_model))
+            new.weight_wrapper_patches[key] = new.weight_wrapper_patches.get(key, []) + [obj]
+        else:
+            new.patches[key] = new.patches.get(key, []) + [(strength_model, "adapter")]
+    return new, clip
 
 
 _kds_stub = _install_stubs()
@@ -203,10 +263,9 @@ UI_DEFAULTS = dict(transform="dct", mode="manual", model_preset="flux",
                    diversity_cfg=4.5, diversity_pattern="turbo")
 
 
-def run_hooks(p, enabled=True, seeds=(123,), uc=None, **overrides):
-    """Drive before_process_batch + process_before_every_sampling."""
+def run_before(script, p, enabled=True, seeds=(123,), **overrides):
+    """Drive before_process_batch with the UI values in Forge's order."""
     ui = {**UI_DEFAULTS, **overrides}
-    script = speed_forge.SpeedForgeScript()
     script.before_process_batch(
         p, enabled, ui["transform"], ui["mode"], ui["model_preset"],
         ui["scales"], ui["adaptive_delta"], ui["delta"], ui["sigma_divisor"],
@@ -214,6 +273,14 @@ def run_hooks(p, enabled=True, seeds=(123,), uc=None, **overrides):
         ui["apply_hr"], ui["diversity_enabled"], ui["diversity_ref_steps"],
         ui["diversity_cfg"], ui["diversity_pattern"],
         seeds=list(seeds), prompts=["test"], subseeds=[0])
+
+
+def run_hooks(p, enabled=True, seeds=(123,), uc=None, loras=None, **overrides):
+    """Drive before_process_batch [+ LoRA activation] + process_before_every_sampling."""
+    script = speed_forge.SpeedForgeScript()
+    run_before(script, p, enabled, seeds, **overrides)
+    if loras is not None:
+        fake_activate(p, loras)
     script.process_before_every_sampling(p, x=None, noise=None, c="cond", uc=uc)
     return script
 
@@ -231,18 +298,55 @@ def flow_schedule(n, shift=KREA_SHIFT):
     return shift * t / (1.0 + (shift - 1.0) * t)
 
 
-class _FakeKrea2:
+class _FakeForgeModel:
     is_inpaint = False
+
+    def __init__(self):
+        self.original_unet = FakePatcher()
+        self.forge_objects = SimpleNamespace(unet=self.original_unet, clip=None)
+        self.current_lora_hash = "[]"
+
+
+class _FakeKrea2(_FakeForgeModel):
+    pass
 
 
 _FakeKrea2.__name__ = "Krea2"
 
 
-class _FakeZImage:
-    is_inpaint = False
+class _FakeZImage(_FakeForgeModel):
+    pass
 
 
 _FakeZImage.__name__ = "ZImage"
+
+TURBO = "/loras/krea2_turbo_lora_rank_64_bf16.safetensors"
+STYLE = "/loras/style_detail.safetensors"
+LORA_KEYS = {
+    TURBO: ["blocks.0.attn.weight", "blocks.1.mlp.weight"],
+    # shares a key with the Turbo LoRA: online and baked coexist per key
+    STYLE: ["blocks.0.attn.weight", "blocks.5.mlp.weight"],
+}
+DEFAULT_LORAS = ((TURBO, 0.6), (STYLE, 0.8))
+
+
+def fake_activate(p, loras, online=False):
+    """networks.load_networks: hash-cached, resets to the original unet, then
+    loads each LoRA through the module attribute (so interception applies)."""
+    m = p.sd_model
+    if not hasattr(m, "forge_objects"):
+        return
+    h = str([[f, s, s, online] for f, s in loras])
+    if m.current_lora_hash == h:
+        return
+    m.current_lora_hash = h
+    unet = m.original_unet
+    for f, s in loras:
+        unet, _ = sys.modules["networks"].load_lora_for_models(
+            unet, None, LORA_KEYS[f], s, s, filename=f, online_mode=online)
+    m.forge_objects.unet = unet
+    _TURBO_OBJECTS[:] = [o for objs in unet.weight_wrapper_patches.values()
+                         for o in objs if o.name == TURBO]
 
 # Turbo LoRA patch objects whose strength RecordingSampler records per call.
 _TURBO_OBJECTS = []
@@ -283,12 +387,21 @@ ORIGINAL_ARGS = {"cond": "cond", "uncond": None, "cond_scale": 1.0,
                  "image_cond": None, "s_min_uncond": 0.0}
 
 
-def run_div_pass(p, sigmas, model=None, seen=None, **ui):
-    """Hooks plus one wrapped sampling pass; returns the sampler output."""
-    run_hooks(p, **{**DIV_UI, **ui})
-    return p.sampler.func(model, torch.randn(1, 4, 32, 32), sigmas=sigmas,
-                          extra_args=ORIGINAL_ARGS, disable=True,
-                          callback=None if seen is None else (lambda d: seen.append(d["i"])))
+def run_div_pass(p, sigmas, model=None, seen=None, loras=DEFAULT_LORAS, uc=None, **ui):
+    """Hooks, LoRA activation and one wrapped sampling pass; returns the script."""
+    script = run_hooks(p, loras=loras, uc=uc, **{**DIV_UI, **ui})
+    p.sampler.func(model, torch.randn(1, 4, 32, 32), sigmas=sigmas,
+                   extra_args=ORIGINAL_ARGS, disable=True,
+                   callback=None if seen is None else (lambda d: seen.append(d["i"])))
+    return script
+
+
+def capture_log():
+    """Swap speed_forge._log for a list collector; returns (list, restore)."""
+    out = []
+    orig = speed_forge._log
+    speed_forge._log = out.append
+    return out, lambda: setattr(speed_forge, "_log", orig)
 
 
 class ForgeScriptTestCase(unittest.TestCase):
@@ -301,8 +414,17 @@ class ForgeScriptTestCase(unittest.TestCase):
         cls.wrapped_passes = 0
         cls.completed_passes = 0
         cls.diversity = None
+        cls.turbo_route = None
+        cls.turbo_membership = None
+        cls.turbo_cycle_open = False
+        cls.turbo_entries = []
+        cls.turbo_blockers = []
         _kds_stub.torch = torch
         sys.modules["modules.shared"].opts.skip_early_cond = 0.0
+        sys.modules["modules.scripts"].scripts_data = []
+        LOADER_CALLS.clear()
+        _TURBO_OBJECTS.clear()
+        _PAYLOAD["factory"] = _default_payload
 
 
 # =============================================================================
@@ -560,9 +682,7 @@ class TestDiversityStage(ForgeScriptTestCase):
     def test_existing_uc_is_reused(self):
         fake = RecordingSampler()
         p = make_div_p(fake)
-        run_hooks(p, uc="FORGE_UC", **DIV_UI)
-        p.sampler.func(None, torch.randn(1, 4, 32, 32), sigmas=self.sigmas,
-                       extra_args=ORIGINAL_ARGS, disable=True)
+        run_div_pass(p, self.sigmas, uc="FORGE_UC")
         self.assertEqual(p.encodes, [])
         self.assertEqual(fake.calls[0]["uncond"], "FORGE_UC")
 
@@ -604,7 +724,8 @@ class TestDiversityStage(ForgeScriptTestCase):
         info = p.extra_generation_params["SPEED"]
         self.assertTrue(info.startswith("dct/manual/flux scales=0.5,1.0"), info)
         self.assertTrue(info.endswith(
-            f" diversity(ref=28, cfg=4.5, coarse={fake.calls[0]['steps']})"), info)
+            " diversity(ref=28, cfg=4.5, lora=krea2_turbo_lora_rank_64_bf16:0.6, "
+            f"coarse={fake.calls[0]['steps']})"), info)
 
     def test_experimental_models_run_and_are_tagged(self):
         fake = RecordingSampler()
@@ -720,14 +841,275 @@ class TestDiversityStandDowns(ForgeScriptTestCase):
     def test_guidance_override_logged(self):
         sys.modules["modules.shared"].opts.skip_early_cond = 0.2
         fake = RecordingSampler()
-        out = []
-        orig = speed_forge._log
-        speed_forge._log = out.append
+        out, restore = capture_log()
         try:
             run_div_pass(make_div_p(fake), self.sigmas)
         finally:
-            speed_forge._log = orig
+            restore()
         self.assertTrue(any("Skip Early CFG" in m for m in out), out)
+
+
+
+class TestTurboLoRA(ForgeScriptTestCase):
+    def setUp(self):
+        super().setUp()
+        self.sigmas = flow_schedule(12)
+
+    def _calls_for(self, filename):
+        return [c for c in LOADER_CALLS if c["filename"] == filename]
+
+    def _assert_stood_down(self, fake):
+        for call in fake.calls:
+            self.assertIs(call["extra_args"], ORIGINAL_ARGS)
+            self.assertTrue(all(v == 0.6 for v in call["turbo_strengths"]))
+
+    def test_only_the_turbo_file_is_routed_online(self):
+        p = make_div_p(RecordingSampler())
+        run_div_pass(p, self.sigmas)
+        (turbo,), (style,) = self._calls_for(TURBO), self._calls_for(STYLE)
+        self.assertTrue(turbo["online_mode"])
+        self.assertEqual(turbo["strength_model"], 0.6)
+        # the other LoRA reaches the stock loader with its original arguments
+        self.assertFalse(style["online_mode"])
+        self.assertEqual((style["strength_model"], style["strength_clip"]), (0.8, 0.8))
+        self.assertIs(style["lora"], LORA_KEYS[STYLE])
+        unet = p.sd_model.forge_objects.unet
+        self.assertEqual(sorted(unet.patches), sorted(LORA_KEYS[STYLE]))
+        self.assertEqual(sorted(unet.weight_wrapper_patches), sorted(LORA_KEYS[TURBO]))
+        self.assertEqual(len(speed_forge.SpeedForgeScript.turbo_entries), 2)
+
+    def test_strength_zero_for_coarse_base_for_fine(self):
+        fake = RecordingSampler()
+        run_div_pass(make_div_p(fake), self.sigmas)
+        coarse, fine = fake.calls
+        self.assertEqual(coarse["turbo_strengths"], [0.0, 0.0])
+        self.assertEqual(fine["turbo_strengths"], [0.6, 0.6])
+        self.assertEqual([o.patch[0][0] for o in _TURBO_OBJECTS], [0.6, 0.6])
+
+    def test_parked_at_base_by_postprocess(self):
+        fake = RecordingSampler()
+        p = make_div_p(fake)
+        script = run_div_pass(p, self.sigmas)
+        for o in _TURBO_OBJECTS:
+            o.patch[0][0] = 0.0   # e.g. a run that ended outside the wrapper
+        script.postprocess(p, None)
+        self.assertEqual([o.patch[0][0] for o in _TURBO_OBJECTS], [0.6, 0.6])
+
+    def test_interrupted_coarse_segment_leaves_lora_whole(self):
+        fake = RecordingSampler(raise_at_call=1)
+        p = make_div_p(fake)
+        with self.assertRaises(RuntimeError):
+            run_div_pass(p, self.sigmas)
+        self.assertEqual(fake.calls[0]["turbo_strengths"], [0.0, 0.0])
+        self.assertEqual([o.patch[0][0] for o in _TURBO_OBJECTS], [0.6, 0.6])
+
+    def test_tuple_payloads_are_rebuilt(self):
+        _PAYLOAD["factory"] = lambda s: (s, "adapter", 1.0, None, None)
+        fake = RecordingSampler()
+        run_div_pass(make_div_p(fake), self.sigmas)
+        self.assertEqual(fake.calls[0]["turbo_strengths"], [0.0, 0.0])
+        self.assertEqual(fake.calls[1]["turbo_strengths"], [0.6, 0.6])
+
+    def test_no_matching_lora_stands_down(self):
+        fake = RecordingSampler()
+        p = make_div_p(fake)
+        out, restore = capture_log()
+        try:
+            run_div_pass(p, self.sigmas, loras=((STYLE, 0.8),))
+        finally:
+            restore()
+        self._assert_stood_down(fake)
+        self.assertTrue(any("no prompt LoRA matches the Turbo pattern 'turbo'" in m
+                            for m in out), out)
+        self.assertEqual(p.encodes, [])
+        self.assertNotIn("diversity", p.extra_generation_params["SPEED"])
+        self.assertFalse(self._calls_for(STYLE)[0]["online_mode"])
+
+    def test_pattern_alternatives(self):
+        fake = RecordingSampler()
+        run_div_pass(make_div_p(fake), self.sigmas, diversity_pattern="lightning, STYLE")
+        # the style file now matches, the turbo file does not
+        self.assertTrue(self._calls_for(STYLE)[0]["online_mode"])
+        self.assertFalse(self._calls_for(TURBO)[0]["online_mode"])
+        self.assertEqual(fake.calls[0]["cond_scale"], 4.5)
+
+    def test_drift_refused(self):
+        _PAYLOAD["factory"] = lambda s: [s, "adapter", 1.0, None, None, True]
+        fake = RecordingSampler()
+        p = make_div_p(fake)
+        out, restore = capture_log()
+        try:
+            run_div_pass(p, self.sigmas)
+        finally:
+            restore()
+        self._assert_stood_down(fake)
+        self.assertEqual(speed_forge.SpeedForgeScript.turbo_entries, [])
+        self.assertTrue(any("refusing to drive its patches" in m and "arity" in m
+                            for m in out), out)
+
+    def test_outer_interceptor_already_routing_online(self):
+        networks = sys.modules["networks"]
+        inner = networks.load_lora_for_models
+
+        def outer(model, clip, lora, sm, sc, filename="default", online_mode=False):
+            # another extension installed after us, forcing on-the-fly loading
+            return inner(model, clip, lora, sm, sc, filename,
+                         True if "turbo" in filename else online_mode)
+
+        networks.load_lora_for_models = outer
+        try:
+            fake = RecordingSampler()
+            out, restore = capture_log()
+            try:
+                run_div_pass(make_div_p(fake), self.sigmas)
+            finally:
+                restore()
+        finally:
+            networks.load_lora_for_models = inner
+        self._assert_stood_down(fake)
+        self.assertEqual(speed_forge.SpeedForgeScript.turbo_entries, [])
+        self.assertTrue(any("already loads it on the fly" in m for m in out), out)
+
+    def test_global_on_the_fly_option_is_not_a_conflict(self):
+        with _fake_backend_args(ref_latents=[]) as args:
+            args.dynamic_args.online_lora = True
+            fake = RecordingSampler()
+            p = make_div_p(fake)
+            script = speed_forge.SpeedForgeScript()
+            run_before(script, p, **DIV_UI)
+            fake_activate(p, DEFAULT_LORAS, online=True)
+            script.process_before_every_sampling(p, uc=None)
+            p.sampler.func(None, torch.randn(1, 4, 32, 32), sigmas=self.sigmas,
+                           extra_args=ORIGINAL_ARGS, disable=True)
+        self.assertEqual(fake.calls[0]["turbo_strengths"], [0.0, 0.0])
+        self.assertEqual(fake.calls[1]["turbo_strengths"], [0.6, 0.6])
+
+    def test_builtin_lora_control_owns_it(self):
+        class LoRAControl:
+            mapping = {TURBO: [(0.0, 0.0), (1.0, 1.0)]}
+
+        sys.modules["modules.scripts"].scripts_data = [SimpleNamespace(script_class=LoRAControl)]
+        fake = RecordingSampler()
+        out, restore = capture_log()
+        try:
+            run_div_pass(make_div_p(fake), self.sigmas)
+        finally:
+            restore()
+        self._assert_stood_down(fake)
+        # passed through untouched, not routed by us
+        self.assertFalse(self._calls_for(TURBO)[0]["online_mode"])
+        self.assertTrue(any("LoRA Control Integrated" in m for m in out), out)
+
+    def test_neo_loractl_owns_it(self):
+        class NeoLoraCtlScript:
+            enabled = True
+            patterns = ["turbo"]
+            filter_mode = "include"
+
+        loractl_core = types.ModuleType("neo_loractl_core")
+
+        def lora_is_scheduled(filename, patterns, mode):
+            matched = any(p in filename.lower() for p in patterns)
+            return matched if mode == "include" else not matched
+
+        loractl_core.lora_is_scheduled = lora_is_scheduled
+        sys.modules["neo_loractl_core"] = loractl_core
+        sys.modules["modules.scripts"].scripts_data = [
+            SimpleNamespace(script_class=NeoLoraCtlScript)]
+        try:
+            fake = RecordingSampler()
+            run_div_pass(make_div_p(fake), self.sigmas)
+            self._assert_stood_down(fake)
+            # with its default exclude filter it leaves the Turbo LoRA alone
+            NeoLoraCtlScript.filter_mode = "exclude"
+            fake2 = RecordingSampler()
+            run_div_pass(make_div_p(fake2), self.sigmas)
+            self.assertEqual(fake2.calls[0]["turbo_strengths"], [0.0, 0.0])
+        finally:
+            sys.modules.pop("neo_loractl_core", None)
+
+    def test_lora_hash_nulled_only_on_membership_change(self):
+        p = make_div_p(RecordingSampler())
+        m = p.sd_model
+
+        def before(**ui):
+            run_before(speed_forge.SpeedForgeScript(), p, **{**DIV_UI, **ui})
+            return m.current_lora_hash
+
+        self.assertEqual(before(diversity_enabled=False), "[]")      # off -> off
+        self.assertIsNone(before())                                   # off -> on
+        fake_activate(p, DEFAULT_LORAS)
+        cached = m.current_lora_hash
+        self.assertEqual(before(), cached)                            # on -> on
+        self.assertEqual(before(diversity_cfg=6.0, diversity_ref_steps=40), cached)
+        self.assertIsNone(before(diversity_pattern="turbo, lightning"))  # pattern
+        fake_activate(p, DEFAULT_LORAS)
+        self.assertIsNone(before(diversity_enabled=False))            # on -> off
+        fake_activate(p, DEFAULT_LORAS)
+        cached = m.current_lora_hash
+        self.assertEqual(before(diversity_enabled=False), cached)     # off -> off
+        self.assertEqual(before(enabled=False), cached)               # SPEED off too
+        self.assertIsNone(before())                                   # back on
+        fake_activate(p, DEFAULT_LORAS)
+        cached = m.current_lora_hash
+        self.assertIsNone(before(enabled=False))                      # SPEED off
+
+    def test_unsupported_model_never_routes(self):
+        p = make_div_p(RecordingSampler())
+        p.sd_model.__class__ = type("Flux", (_FakeForgeModel,), {})
+        run_div_pass(p, self.sigmas)
+        self.assertFalse(self._calls_for(TURBO)[0]["online_mode"])
+        self.assertEqual(p.sd_model.current_lora_hash.count("False"), 2)
+
+    def test_toggling_off_reloads_the_turbo_lora_baked(self):
+        fake = RecordingSampler()
+        p = make_div_p(fake)
+        run_div_pass(p, self.sigmas)
+        LOADER_CALLS.clear()
+        run_div_pass(p, self.sigmas, diversity_enabled=False)
+        self.assertFalse(self._calls_for(TURBO)[0]["online_mode"])
+        self.assertEqual(p.sd_model.forge_objects.unet.weight_wrapper_patches, {})
+
+    def test_cached_loader_keeps_adoption_across_runs(self):
+        p = make_div_p(RecordingSampler())
+        run_div_pass(p, self.sigmas).postprocess(p, None)
+        LOADER_CALLS.clear()
+        fake = RecordingSampler()
+        p.sampler.func = fake
+        run_div_pass(p, self.sigmas)
+        self.assertEqual(LOADER_CALLS, [])          # the stock loader's cache hit
+        self.assertEqual(fake.calls[0]["turbo_strengths"], [0.0, 0.0])
+        self.assertEqual(fake.calls[1]["turbo_strengths"], [0.6, 0.6])
+
+    def test_turbo_removed_from_prompt_stands_down(self):
+        p = make_div_p(RecordingSampler())
+        run_div_pass(p, self.sigmas).postprocess(p, None)
+        fake = RecordingSampler()
+        p.sampler.func = fake
+        _TURBO_OBJECTS.clear()
+        run_div_pass(p, self.sigmas, loras=((STYLE, 0.8),))
+        self._assert_stood_down(fake)
+        self.assertEqual(speed_forge.SpeedForgeScript.turbo_entries, [])
+
+    def test_stale_entries_from_an_earlier_load_are_dropped(self):
+        # hires prompts can re-run activate inside setup_conds; only the
+        # objects in the unet about to sample may be driven
+        p = make_div_p(RecordingSampler())
+        script = speed_forge.SpeedForgeScript()
+        run_before(script, p, **DIV_UI)
+        fake_activate(p, DEFAULT_LORAS)
+        stale = list(_TURBO_OBJECTS)
+        fake_activate(p, ((TURBO, 0.5),))
+        fresh = list(_TURBO_OBJECTS)
+        self.assertEqual(len(speed_forge.SpeedForgeScript.turbo_entries), 4)
+        script.process_before_every_sampling(p, uc=None)
+        p.sampler.func(None, torch.randn(1, 4, 32, 32), sigmas=self.sigmas,
+                       extra_args=ORIGINAL_ARGS, disable=True)
+        self.assertEqual([o.patch[0][0] for o in stale], [0.6, 0.6])
+        self.assertEqual([o.patch[0][0] for o in fresh], [0.5, 0.5])
+        self.assertEqual(len(speed_forge.SpeedForgeScript.turbo_entries), 2)
+        self.assertTrue(p.extra_generation_params["SPEED"].endswith(
+            "lora=krea2_turbo_lora_rank_64_bf16:0.5, coarse=10)"))
 
 
 if __name__ == "__main__":
