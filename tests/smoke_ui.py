@@ -19,18 +19,21 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import gradio as gr  # noqa: E402
 
 
-class InputAccordion(gr.Checkbox):
+class InputAccordion:
     """Forge's InputAccordion reduced to its shape: a hidden checkbox (the
-    input value) plus an accordion that holds the section's components."""
+    input value) plus an accordion that holds the section's components.
+    ``with InputAccordion(...) as x`` yields the checkbox, as Forge's does
+    (there the class is itself the checkbox). Not a gr.Checkbox subclass:
+    stock gradio writes a .pyi stub for every Component subclass it sees."""
 
     def __init__(self, value=None, **kwargs):
         label = kwargs.get("label", "Accordion")
-        super().__init__(value=value, label=label, visible=False)
+        self.checkbox = gr.Checkbox(value=value, label=label, visible=False)
         self.accordion = gr.Accordion(label=label, open=bool(value))
 
     def __enter__(self):
         self.accordion.__enter__()
-        return self
+        return self.checkbox
 
     def __exit__(self, *args):
         return self.accordion.__exit__(*args)
