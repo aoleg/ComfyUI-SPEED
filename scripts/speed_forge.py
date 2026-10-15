@@ -829,7 +829,8 @@ def _make_speed_func(base_fn, cfg: dict):
                     f"{div['infotext_base']} {_diversity_infotext(div, run)}")
             elif not run.get("no_transition_logged"):
                 _log("diversity: no coarse segment ran in this pass (it starts below "
-                     "the transition sigma); RAW stage not applied")
+                     "the transition sigma, or the sigma divisor dropped the "
+                     "transition); RAW stage not applied")
 
         SpeedForgeScript.completed_passes += 1
         return result

@@ -955,6 +955,26 @@ class TestDiversityStandDowns(ForgeScriptTestCase):
         self._assert_plain_speed(fake)
         self.assertNotIn("diversity", p.extra_generation_params["SPEED"])
 
+    def test_divisor_dropping_the_transition_is_a_plain_pass(self):
+        # PR #1 repro settings: krea-2 pins sigma* to 0.9000 with adaptive on,
+        # and a 0.9 divisor puts it at the top of the schedule, so SPEED drops
+        # the transition. The RAW stage must stand down, not switch anything.
+        fake = RecordingSampler()
+        p = make_div_p(fake)
+        out, restore = capture_log()
+        try:
+            run_div_pass(p, self.sigmas, mode="neo_shift", model_preset="krea-2",
+                         sigma_divisor=0.9, adaptive_delta=True, delta=0.01)
+        finally:
+            restore()
+        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(fake.calls[0]["shape"], (1, 4, 32, 32))
+        self.assertEqual(fake.calls[0]["steps"], 12)
+        self._assert_plain_speed(fake)
+        self.assertEqual(REBAKES, [])
+        self.assertNotIn("diversity", p.extra_generation_params["SPEED"])
+        self.assertTrue(any("sigma divisor dropped the transition" in m for m in out), out)
+
     def test_guidance_override_logged(self):
         sys.modules["modules.shared"].opts.skip_early_cond = 0.2
         fake = RecordingSampler()
