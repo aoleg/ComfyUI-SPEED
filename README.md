@@ -43,6 +43,27 @@ Notes for the webui version:
 - If a transition threshold is never reached (too few steps / too small `delta`), the console warns and the output stays at the coarse resolution — increase steps or `delta`.
 - Settings are recorded in the image infotext under the `SPEED:` key.
 - The webui's **Mode** dropdown has a third option, `neo_shift` (default), not present in the ComfyUI node or the SwarmUI extension — see [neo_shift mode](#neo_shift-mode-forge-neo-only).
+- The accordion has a **Diversity: RAW composition stage (Krea 2)** subsection, also webui-only; see [RAW composition stage](#raw-composition-stage-forge-neo-only-krea-2).
+
+### RAW composition stage (Forge Neo only, Krea 2)
+
+For the community recipe of a Krea 2 RAW checkpoint plus the Turbo LoRA in the prompt (for example `<lora:krea2_turbo_lora_rank_64_bf16:0.6>` at about 12 steps, CFG 1). Turbo trades seed variety for quality; RAW keeps the variety. With the subsection enabled, the steps SPEED runs at reduced resolution become a RAW stage: the Turbo LoRA is held at strength 0, the negative prompt is encoded and applied with real CFG, and those steps run at the density the RAW model expects. From the first full-resolution step on, the Turbo LoRA returns at the strength written in the prompt and sampling continues on the main CFG (normally 1) with your remaining steps. Composition is decided where the latent is cheap and guidance is real; Turbo refines what is already laid out. Design and reasoning: [docs/krea2-hybrid-analysis.md](docs/krea2-hybrid-analysis.md) and [docs/krea2-hybrid-plan.md](docs/krea2-hybrid-plan.md).
+
+| Control | Default | Meaning |
+|---|---|---|
+| Reference steps | 28 | The step count the RAW model would run on its own, 28 (diffusers default) to 52 (official repo). Only the part of that schedule above SPEED's transition sigma runs, so 28 gives about 8 to 10 RAW steps at the `krea-2` preset's transition. Built with your scheduler and the model's shift. |
+| RAW CFG | 4.5 | CFG for the RAW stage, in the standard convention used by Forge, ComfyUI and SwarmUI. Krea computes `cond + g * (cond - uncond)`, so 4.5 here equals Krea's 3.5. |
+| Turbo LoRA pattern | `turbo` | Comma-separated, case-insensitive substrings of the LoRA filename. Only matching prompt LoRAs are switched; every other LoRA keeps its prompt strength the whole run. |
+
+- **A Turbo LoRA in the prompt is required.** When no prompt LoRA matches the pattern, the stage stands down for the run with a console line and SPEED runs as usual. It never runs real CFG on a model it cannot switch off Turbo for.
+- **The negative prompt box stays editable at CFG 1** while both the SPEED checkbox and the subsection are on, and goes back to Forge's rule when either is off. The negative prompt only acts in the RAW stage.
+- **Tested on Krea 2 only.** Z-Image and FLUX.2 Klein have community Turbo LoRAs and run with an `experimental` tag in the console and infotext, uncalibrated. Other models stand down.
+- The Turbo LoRA is loaded on the fly (Forge's per-key online mode) instead of baked, so its strength can change between segments at no reload cost. That costs a weight clone per forward on the layers it patches, the same as Forge's own on-the-fly LoRA option, and on int8 checkpoints its full-resolution output is perceptually but not pixel-identical to a baked LoRA. Toggling the subsection or changing the pattern makes Forge reload the prompt LoRAs once.
+- The hires-fix pass, img2img passes that start below the transition sigma, and runs where no transition fits are left alone. An img2img pass that starts above the transition keeps its own step density but still gets the RAW CFG and LoRA switch.
+- **Step-scheduled prompt syntax** (`[a:b:0.5]` and friends) shifts its switch points while the stage is on, because the RAW stage makes more model calls than the step count. Plain prompts are unaffected.
+- **Skip Early CFG** and **NGMS** can force the scale back to 1.0 on some steps; the console says so when either is set.
+- If Forge's LoRA Control Integrated (`<lora:name:[a:b]>`) or Neo-LoraCtl already drives the Turbo LoRA's strength, the stage stands down rather than fight it. Neo-LoraCtl's default filter excludes accelerator LoRAs, so the two coexist out of the box, and so does Neo-Krea2-NAG's own negative prompt unlock.
+- The infotext gains `diversity(ref=28, cfg=4.5, lora=<name>:<strength>, coarse=<RAW steps>)` inside the `SPEED:` value.
 
 ## Usage (SwarmUI)
 
