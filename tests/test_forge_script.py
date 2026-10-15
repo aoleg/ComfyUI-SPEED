@@ -531,6 +531,8 @@ class ForgeScriptTestCase(unittest.TestCase):
         cls.turbo_baked = []
         cls.turbo_baked_patterns = None
         cls.turbo_unbaked = None
+        cls.turbo_pinned = False
+        cls.turbo_pin_off = None
         LOADER_CALLS.clear()
         REBAKES.clear()
         _REBAKE["fail"] = 0
@@ -1420,6 +1422,139 @@ class TestTurboLoRABaked(ForgeScriptTestCase):
         flips = [m for m in out if "Turbo LoRA off" in m or "Turbo LoRA back on" in m]
         self.assertEqual(len(flips), 2, out)
         self.assertIn("2 of 2 weights rewritten", flips[0])
+
+
+
+Dimension = __import__("collections").namedtuple("Dimension", ["weight", "inplace_update"])
+
+
+class _QuantTensor(torch.Tensor):
+    """Stands in for a quantized tensor subclass, which must not be pinned."""
+
+
+class TestPinBackups(ForgeScriptTestCase):
+    def setUp(self):
+        super().setUp()
+        self.pinned = []
+        self.saved = {name: getattr(speed_forge, name) for name in
+                      ("_pin_available", "_pin_tensor", "_is_pinned", "_ram_total",
+                       "_release_pinned", "_pin_backups")}
+        speed_forge._pin_available = lambda: True
+
+        def pin(t):
+            copy = t.clone()
+            self.pinned.append(copy)
+            return copy
+
+        speed_forge._pin_tensor = pin
+        speed_forge._is_pinned = lambda t: any(t.data_ptr() == x.data_ptr() for x in self.pinned)
+        speed_forge._ram_total = lambda: 64 * 2 ** 30
+        self.sigmas = flow_schedule(12)
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(speed_forge, name, value)
+
+    def _patcher(self):
+        patcher = FakePatcher()
+        param = torch.nn.Parameter(torch.ones(4, 4), requires_grad=False)
+        patcher.backup = {
+            "a.weight": Dimension(torch.arange(16, dtype=torch.int8).reshape(4, 4), False),
+            "b.weight": Dimension(param, True),
+            "other.weight": Dimension(torch.zeros(2), False),
+            "quant.weight": Dimension(torch.zeros(3).as_subclass(_QuantTensor), False),
+        }
+        return patcher
+
+    def test_pins_the_given_plain_cpu_backups_once(self):
+        patcher = self._patcher()
+        before = dict(patcher.backup)
+        n, size, _ = speed_forge._pin_backups(
+            patcher, ["a.weight", "b.weight", "quant.weight", "missing.weight"])
+        self.assertEqual(n, 2)
+        self.assertEqual(size, 16 * 1 + 16 * 4)
+        a, b = patcher.backup["a.weight"], patcher.backup["b.weight"]
+        self.assertIs(a.weight, self.pinned[0])
+        self.assertTrue(torch.equal(a.weight, before["a.weight"].weight))
+        self.assertEqual(a.weight.dtype, torch.int8)
+        self.assertFalse(a.inplace_update)
+        self.assertIsInstance(b.weight, torch.nn.Parameter)
+        self.assertTrue(b.inplace_update)
+        self.assertIs(patcher.backup["other.weight"], before["other.weight"])
+        self.assertIs(patcher.backup["quant.weight"], before["quant.weight"])
+        # clones share the backup dict, so they see the pinned copies
+        self.assertIs(patcher.clone().backup["a.weight"], a)
+        self.assertEqual(speed_forge._pin_backups(patcher, ["a.weight", "b.weight"]),
+                         (0, 0, 0.0))
+
+    def test_budget_and_failure_give_up_for_the_session(self):
+        cls = speed_forge.SpeedForgeScript
+        baked = [("a.weight", object(), 0.6, "turbo"), ("b.weight", object(), 0.6, "turbo")]
+        out, restore = capture_log()
+        try:
+            speed_forge._ram_total = lambda: 100      # 40% of 100 bytes
+            patcher = self._patcher()
+            cls._pin_turbo_backups(patcher, baked)
+            self.assertEqual(cls.turbo_pin_off, "budget")
+            self.assertEqual(self.pinned, [])
+            speed_forge._ram_total = lambda: 64 * 2 ** 30
+            cls._pin_turbo_backups(patcher, baked)    # not retried
+            self.assertEqual(self.pinned, [])
+
+            cls.turbo_pin_off = None
+
+            def boom(t):
+                raise RuntimeError("cudaHostAlloc failed")
+
+            speed_forge._pin_tensor = boom
+            cls._pin_turbo_backups(patcher, baked)
+            self.assertEqual(cls.turbo_pin_off, "cudaHostAlloc failed")
+            self.assertFalse(cls.turbo_pinned)
+        finally:
+            restore()
+        self.assertEqual(sum("not pinning them" in m for m in out), 1, out)
+        self.assertEqual(sum("could not pin" in m for m in out), 1, out)
+
+    def test_pinned_before_the_first_off_switch_only(self):
+        order = []
+        real_rebake = speed_forge._rebake_keys
+
+        def spy_pin(patcher, keys):
+            order.append(("pin", sorted(keys)))
+            return 2, 1024, 0.01
+
+        def spy_rebake(patcher, keys):
+            order.append(("rebake",))
+            return real_rebake(patcher, keys)
+
+        speed_forge._pin_backups = spy_pin
+        speed_forge._rebake_keys = spy_rebake
+        out, restore = capture_log()
+        try:
+            run_div_pass(make_div_p(RecordingSampler()), self.sigmas)
+        finally:
+            restore()
+        self.assertEqual(order, [("pin", sorted(LORA_KEYS[TURBO])), ("rebake",), ("rebake",)])
+        self.assertTrue(speed_forge.SpeedForgeScript.turbo_pinned)
+        self.assertTrue(any("pinned 2 Turbo weight backups" in m for m in out), out)
+
+    def test_cached_pinned_memory_released_once_the_adoption_is_gone(self):
+        released = []
+        speed_forge._release_pinned = lambda: released.append(True)
+        speed_forge._pin_backups = lambda patcher, keys: (2, 1024, 0.01)
+        p = make_div_p(RecordingSampler())
+        run_div_pass(p, self.sigmas).postprocess(p, None)
+        self.assertTrue(speed_forge.SpeedForgeScript.turbo_pinned)
+        # feature off, LoRA still loaded: its backups are still in use
+        run_before(speed_forge.SpeedForgeScript(), p, **{**DIV_UI, "diversity_enabled": False})
+        self.assertEqual(released, [])
+        # the prompt changes and Forge reloads without the Turbo LoRA
+        fake_activate(p, ((STYLE, 0.8),))
+        run_before(speed_forge.SpeedForgeScript(), p, **{**DIV_UI, "diversity_enabled": False})
+        self.assertEqual(released, [True])
+        self.assertFalse(speed_forge.SpeedForgeScript.turbo_pinned)
+        run_before(speed_forge.SpeedForgeScript(), p, **{**DIV_UI, "diversity_enabled": False})
+        self.assertEqual(released, [True])
 
 
 

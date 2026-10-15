@@ -393,6 +393,80 @@ def _switch_baked(unet, entries, scale: float):
     return n, len(keys), time.perf_counter() - started
 
 
+# Pinned (page-locked) host memory copies to the GPU at full DMA speed;
+# Forge's backups are plain pageable tensors (``weight.to(offload_device)``,
+# and Forge's own pin_memory only runs with --pin-shared-memory, for
+# Parameters). The off switch is mostly that copy, so the Turbo keys' backups
+# are swapped once for pinned copies. Capped at this share of system RAM:
+# Windows limits page-locked memory to about half of it.
+_PIN_RAM_SHARE = 0.4
+
+
+def _pin_available() -> bool:
+    return torch.cuda.is_available()
+
+
+def _pin_tensor(tensor):
+    return tensor.pin_memory()
+
+
+def _is_pinned(tensor) -> bool:
+    return tensor.is_pinned()
+
+
+def _ram_total() -> int:
+    import psutil
+    return int(psutil.virtual_memory().total)
+
+
+def _pin_backups(patcher, keys):
+    """Swap the CPU backups of ``keys`` for pinned copies, once per backup.
+
+    The backup dict is shared by every clone of the patcher, so this is seen
+    by all of them, and Forge keeps treating the entries as its own: restore
+    and repatch read ``.weight`` as before, and a pinned tensor freed by
+    Forge goes back to PyTorch's pinned-memory cache (emptied by
+    ``_release_pinned`` once no adoption is left). Only plain CPU tensors
+    are pinned, so a quantized tensor subclass is left as it is. Returns
+    ``(pinned, bytes, seconds)``, or None when the budget does not allow it.
+    """
+    if not _pin_available():
+        return 0, 0, 0.0
+    started = time.perf_counter()
+    todo = []
+    for key in keys:
+        bk = patcher.backup.get(key)
+        weight = getattr(bk, "weight", None)
+        if (type(weight) not in (torch.Tensor, torch.nn.Parameter)
+                or weight.device.type != "cpu" or _is_pinned(weight)):
+            continue
+        todo.append((key, bk, weight))
+    if not todo:
+        return 0, 0, 0.0
+    size = sum(w.numel() * w.element_size() for _, _, w in todo)
+    if size > _PIN_RAM_SHARE * _ram_total():
+        return None
+    pinned = 0
+    for key, bk, weight in todo:
+        copy = _pin_tensor(weight)
+        if isinstance(weight, torch.nn.Parameter):
+            copy = torch.nn.Parameter(copy, requires_grad=weight.requires_grad)
+        patcher.backup[key] = bk._replace(weight=copy)
+        pinned += 1
+    return pinned, size, time.perf_counter() - started
+
+
+def _release_pinned():
+    """Hand PyTorch's cached pinned blocks back to the OS once the backups
+    pinned for the Turbo LoRA are gone (a new load or another prompt)."""
+    empty = getattr(torch._C, "_host_emptyCache", None)
+    if empty is not None and _pin_available():
+        try:
+            empty()
+        except Exception:
+            pass
+
+
 def _global_online_lora() -> bool:
     try:
         from backend.args import dynamic_args
@@ -648,6 +722,7 @@ def _switch_turbo(div: dict, run: dict, scale: float):
         cls = SpeedForgeScript
         unet = div["p"].sd_model.forge_objects.unet
         if scale != 1.0:
+            cls._pin_turbo_backups(unet, div["baked"])
             cls.turbo_unbaked = (unet, div["baked"])
         n, total, seconds = _switch_baked(unet, div["baked"], scale)
         if scale == 1.0:
@@ -792,6 +867,10 @@ class SpeedForgeScript(scripts.Script):
     # (unet, baked entries) while the baked Turbo LoRA is switched off, so
     # postprocess can put it back if a pass ended between the two switches.
     turbo_unbaked: tuple | None = None
+    # Backups of the Turbo keys swapped for pinned copies (see _pin_backups);
+    # ``turbo_pin_off`` is why pinning was given up for this session, if it was.
+    turbo_pinned: bool = False
+    turbo_pin_off: str | None = None
 
     def title(self):
         return "SPEED (Spectral Progressive Diffusion)"
@@ -1030,6 +1109,9 @@ class SpeedForgeScript(scripts.Script):
                   or getattr(model, "forge_objects", None))
         cls.turbo_entries, cls.turbo_baked = cls._live_turbo_entries(
             getattr(cached, "unet", None))
+        if cls.turbo_pinned and not cls.turbo_baked:
+            cls.turbo_pinned = False
+            _release_pinned()
         if route != cls.turbo_membership:
             old, cls.turbo_membership = cls.turbo_membership, route
             if cls._reload_needed(old, route):
@@ -1037,6 +1119,30 @@ class SpeedForgeScript(scripts.Script):
                 cls.turbo_baked = []
                 cls.turbo_blockers = []
                 _null_lora_hash(p)
+
+    @staticmethod
+    def _pin_turbo_backups(unet, baked):
+        cls = SpeedForgeScript
+        if cls.turbo_pin_off is not None:
+            return
+        keys = list(dict.fromkeys(e[0] for e in baked))
+        try:
+            result = _pin_backups(unet, keys)
+        except Exception as e:
+            cls.turbo_pin_off = str(e)
+            _log(f"diversity: could not pin the Turbo weight backups ({e}); the "
+                 "switch copies from pageable memory for the rest of this session.")
+            return
+        if result is None:
+            cls.turbo_pin_off = "budget"
+            _log(f"diversity: the Turbo weight backups need more than "
+                 f"{_PIN_RAM_SHARE:.0%} of system RAM; not pinning them.")
+            return
+        n, size, seconds = result
+        if n:
+            cls.turbo_pinned = True
+            _log(f"diversity: pinned {n} Turbo weight backups "
+                 f"({size / 2 ** 30:.2f} GB, {seconds:.2f} s, once per load)")
 
     @staticmethod
     def _reload_needed(old, new) -> bool:
