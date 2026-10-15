@@ -533,13 +533,25 @@ def _resolve_manual(
 # Segmented sampling.
 # =============================================================================
 
-def _segment_callback(outer_cb, segment_start_idx: int):
-    """Re-base callback step indices to the full schedule."""
+def _segment_callback(outer_cb, segment_start_idx: int, index_map=None):
+    """Re-base callback step indices to the full schedule.
+
+    ``index_map`` (from a ``segment_hook``) first maps an index inside the
+    segment as actually run onto the segment's original index range, for a
+    hook that changed the segment's step count. It may return ``None`` to drop
+    that callback, so a caller counting callbacks still sees one per original
+    step.
+    """
     if outer_cb is None:
         return None
     def inner(d):
         d = dict(d)
-        d["i"] = d.get("i", 0) + segment_start_idx
+        i = d.get("i", 0)
+        if index_map is not None:
+            i = index_map(i)
+            if i is None:
+                return
+        d["i"] = i + segment_start_idx
         outer_cb(d)
     return inner
 
@@ -563,6 +575,7 @@ def sample_speed_core(
     sampler_kwargs: dict = None,
     full_res_sampler_kwargs: dict = None,
     log_fn: Callable[[str], None] = None,
+    segment_hook: Callable = None,
 ):
     """Run ``sampler_fn`` segment-by-segment with spectral expansion in between.
 
@@ -582,6 +595,17 @@ def sample_speed_core(
     ``delta_optimal`` mode; see ``_resolve_transitions`` for what it does and
     why. Callers that never pass it get identical behaviour to before it
     existed.
+
+    ``segment_hook`` (default ``None``, behaviour unchanged) is called once per
+    segment that runs, right before its sampler call, as
+    ``segment_hook(seg_index, scale, seg_sigmas, extra_args)``, and returns
+    ``(seg_sigmas, extra_args, index_map)``. What it returns is what that one
+    sampler call receives; transitions, expansion and the full schedule are
+    not affected, so a hook that replaces ``seg_sigmas`` must keep the first
+    and last entries. ``index_map`` is ``None`` or a callable mapping a
+    callback index inside the segment as run to an index inside the original
+    segment (see ``_segment_callback``). The Forge Neo script uses this for
+    per-segment CFG and step density; the ComfyUI node never passes it.
     """
     extra_args = {} if extra_args is None else extra_args
     sampler_kwargs = dict(sampler_kwargs or {})
@@ -638,11 +662,16 @@ def sample_speed_core(
         seg_end = transitions[seg_i][0] if seg_i < len(transitions) else len(sigmas) - 1
         seg_sigmas = sigmas[seg_start:seg_end + 1]
         if len(seg_sigmas) >= 2:
-            cb = _segment_callback(callback, seg_start)
+            seg_extra_args = extra_args
+            index_map = None
+            if segment_hook is not None:
+                seg_sigmas, seg_extra_args, index_map = segment_hook(
+                    seg_i, scales[seg_i], seg_sigmas, extra_args)
+            cb = _segment_callback(callback, seg_start, index_map)
             seg_kwargs = dict(sampler_kwargs)
             if abs(scales[seg_i] - 1.0) < 1e-6:
                 seg_kwargs.update(full_res_sampler_kwargs)
-            x = sampler_fn(model, x, seg_sigmas, extra_args=extra_args,
+            x = sampler_fn(model, x, seg_sigmas, extra_args=seg_extra_args,
                            callback=cb, disable=disable, **seg_kwargs)
 
         if seg_i >= len(transitions):

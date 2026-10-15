@@ -586,5 +586,108 @@ class TestFFTExpandNp(unittest.TestCase):
             _fft_expand_np(x, (8, 8), t=0.5, seed=42)
 
 
+
+class _StepSampler:
+    """Deterministic fake solver: one update per step that depends on the
+    sigmas it was given, so a changed schedule changes the output."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, model, x, sigmas, extra_args=None, callback=None, disable=None):
+        self.calls.append({"sigmas": [float(s) for s in sigmas],
+                           "extra_args": extra_args, "shape": tuple(x.shape)})
+        for i in range(len(sigmas) - 1):
+            x = x * 0.9 + (float(sigmas[i]) - float(sigmas[i + 1]))
+            if callback is not None:
+                callback({"i": i, "x": x})
+        return x
+
+
+class TestSegmentHook(unittest.TestCase):
+    KW = dict(transform="dct", mode="manual", scales=[0.25, 0.5, 1.0],
+              manual_sigmas=[0.8, 0.6], seed=3)
+
+    def _run(self, hook=None):
+        sampler = _StepSampler()
+        seen = []
+        extra = {"cond_scale": 1.0}
+        x = torch.linspace(-1.0, 1.0, 2 * 4 * 32 * 32).reshape(2, 4, 32, 32)
+        out = _speed_core.sample_speed_core(
+            sampler, None, x, torch.linspace(1.0, 0.0, 21), extra_args=extra,
+            callback=lambda d: seen.append(d["i"]), disable=True,
+            segment_hook=hook, **self.KW)
+        return out, sampler, seen, extra
+
+    def test_no_hook_and_identity_hook_are_byte_identical(self):
+        out_none, s_none, seen_none, extra_none = self._run()
+        received = []
+
+        def identity(seg_i, scale, seg_sigmas, extra_args):
+            received.append((seg_i, scale, [float(v) for v in seg_sigmas]))
+            return seg_sigmas, extra_args, None
+
+        out_id, s_id, seen_id, _ = self._run(identity)
+        self.assertTrue(torch.equal(out_none, out_id))
+        self.assertEqual(seen_none, seen_id)
+        self.assertEqual(seen_none, list(range(20)))
+        self.assertEqual([c["sigmas"] for c in s_none.calls],
+                         [c["sigmas"] for c in s_id.calls])
+        # without a hook the caller's dict reaches every segment as-is
+        self.assertTrue(all(c["extra_args"] is extra_none for c in s_none.calls))
+        # the hook saw each segment once, in order, with its scale and sigmas
+        self.assertEqual([r[:2] for r in received], [(0, 0.25), (1, 0.5), (2, 1.0)])
+        self.assertEqual([r[2] for r in received], [c["sigmas"] for c in s_none.calls])
+
+    def test_hook_sigmas_and_extra_args_reach_the_sampler(self):
+        _, base, _, _ = self._run()
+        coarse = base.calls[0]["sigmas"]
+        dense = torch.linspace(coarse[0], coarse[-1], 9)
+        swapped = {"cond_scale": 4.5, "uncond": "neg"}
+
+        def hook(seg_i, scale, seg_sigmas, extra_args):
+            if seg_i == 0:
+                return dense, swapped, None
+            return seg_sigmas, extra_args, None
+
+        out, s, _, extra = self._run(hook)
+        self.assertEqual(s.calls[0]["sigmas"], [float(v) for v in dense])
+        self.assertIs(s.calls[0]["extra_args"], swapped)
+        self.assertIs(s.calls[1]["extra_args"], extra)
+        self.assertIs(s.calls[2]["extra_args"], extra)
+        # later segments and their shapes are untouched by the swap
+        self.assertEqual(s.calls[1]["sigmas"], base.calls[1]["sigmas"])
+        self.assertEqual(s.calls[2]["sigmas"], base.calls[2]["sigmas"])
+        self.assertEqual([c["shape"] for c in s.calls], [c["shape"] for c in base.calls])
+        self.assertEqual(out.shape, (2, 4, 32, 32))
+
+    def test_mapped_callback_indices_are_monotonic_and_bounded(self):
+        _, base, _, _ = self._run()
+        orig_len = len(base.calls[0]["sigmas"]) - 1
+        new_len = orig_len * 3 + 1
+        coarse = base.calls[0]["sigmas"]
+        dense = torch.linspace(coarse[0], coarse[-1], new_len + 1)
+        last = [-1]
+
+        def index_map(j):
+            i = j * orig_len // new_len
+            if i <= last[0]:
+                return None
+            last[0] = i
+            return i
+
+        def hook(seg_i, scale, seg_sigmas, extra_args):
+            if seg_i == 0:
+                return dense, extra_args, index_map
+            return seg_sigmas, extra_args, None
+
+        _, s, seen, _ = self._run(hook)
+        self.assertEqual(len(s.calls[0]["sigmas"]) - 1, new_len)
+        # one callback per original step, strictly increasing, inside the schedule
+        self.assertEqual(seen, list(range(20)))
+        self.assertTrue(all(b > a for a, b in zip(seen, seen[1:])))
+        self.assertTrue(all(0 <= i < 20 for i in seen))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
