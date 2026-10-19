@@ -319,7 +319,7 @@ def _rebake_keys(patcher, keys):
 
     Unlike Forge's load, this runs in the middle of sampling, after Forge
     has set the VRAM budget for sampling. So each result is copied into the
-    live weight's own memory where it fits (``_fits_in_place``), and the merge
+    live weight's own memory where it fits (``_copy_in_place``), and the merge
     temporaries are handed back to the driver at the end: kept in
     PyTorch's cache, they are VRAM the next stage cannot reuse, and with
     the Windows sysmem fallback it spills to shared memory instead of
@@ -342,9 +342,9 @@ def _rebake_keys(patcher, keys):
         if not remaining:
             # Pure restore: mimic unpatch_model, the backup is the raw
             # original (quantized checkpoints included), set it back as-is.
-            if bk.inplace_update or _fits_in_place(weight, bk.weight, bk.weight):
+            if bk.inplace_update:
                 backend_utils.copy_to_param(patcher.model, key, bk.weight)
-            else:
+            elif not _copy_in_place(weight, bk.weight, bk.weight):
                 backend_utils.set_attr(patcher.model, key,
                                        bk.weight.to(weight.device, copy=True))
             done += 1
@@ -357,28 +357,62 @@ def _rebake_keys(patcher, keys):
         out = merge_lora_to_weight(remaining, temp, key)
         if set_func is None:
             out = stochastic_rounding(out, weight.dtype, seed=string_to_seed(key))
-            if bk.inplace_update or _fits_in_place(weight, out, bk.weight):
+            if bk.inplace_update:
                 backend_utils.copy_to_param(patcher.model, key, out)
-            else:
+            elif not _copy_in_place(weight, out, bk.weight):
                 backend_utils.set_attr(patcher.model, key, out)
         else:
-            set_func(out, inplace_update=bk.inplace_update, seed=string_to_seed(key))
+            # A quantized layer requantizes into a new tensor; take it back
+            # and copy it in. The fallback stores it the way the layer's own
+            # set_weight does (backend/operations_mixed_precision.py).
+            out = set_func(out, inplace_update=bk.inplace_update,
+                           seed=string_to_seed(key), return_weight=True)
+            if not _copy_in_place(weight, out, bk.weight):
+                backend_utils.set_attr(patcher.model, key, out)
         del temp, out
         done += 1
     memory_management.soft_empty_cache()
     return done
 
 
-def _fits_in_place(live, value, backup) -> bool:
-    """Whether ``value`` can be copied into the live weight's memory: both
-    plain tensors of one dtype and shape, and the live weight sharing no
-    storage with the value or the backup (a write would change the backup).
-    A quantized tensor subclass keeps Forge's set_attr."""
-    plain = (torch.Tensor, torch.nn.Parameter)
-    if not (type(live) in plain and type(value) in plain
-            and live.dtype == value.dtype and live.shape == value.shape):
+def _data_tensors(tensor):
+    """The tensors that hold ``tensor``'s data, and the metadata two tensors
+    must share to be copied one into the other: the tensor itself for a plain
+    tensor, the inner tensors of a wrapper subclass with ``__tensor_flatten__``
+    (comfy_kitchen's QuantizedTensor: int8, fp8, NVFP4). None otherwise."""
+    if type(tensor) in (torch.Tensor, torch.nn.Parameter):
+        return [tensor], None
+    flatten = getattr(tensor, "__tensor_flatten__", None)
+    if flatten is None:
+        return None
+    try:
+        names, meta = flatten()
+        return [getattr(tensor, name) for name in names], (type(tensor), names, meta)
+    except Exception:
+        return None
+
+
+def _copy_in_place(live, value, backup) -> bool:
+    """Copy ``value`` into the live weight's own memory; False when it does
+    not fit. The data tensors must match in type, dtype and shape (and a
+    quantized tensor in layout metadata), and the live weight must share no
+    storage with the value or the backup (a write would change the backup)."""
+    dst, src = _data_tensors(live), _data_tensors(value)
+    if dst is None or src is None or dst[1] != src[1] or len(dst[0]) != len(src[0]):
         return False
-    return _storage_ptr(live) not in (_storage_ptr(value), _storage_ptr(backup))
+    plain = (torch.Tensor, torch.nn.Parameter)
+    if any(type(d) not in plain or type(s) not in plain
+           or d.dtype != s.dtype or d.shape != s.shape
+           for d, s in zip(dst[0], src[0])):
+        return False
+    held = _data_tensors(backup)
+    taken = {_storage_ptr(t) for t in src[0] + (held[0] if held else [])}
+    targets = {_storage_ptr(d) for d in dst[0]}
+    if None in targets or targets & taken:
+        return False
+    for d, s in zip(dst[0], src[0]):
+        d.data.copy_(s)
+    return True
 
 
 def _storage_ptr(tensor):
