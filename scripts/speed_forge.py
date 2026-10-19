@@ -316,7 +316,14 @@ def _rebake_keys(patcher, keys):
     A key with no backup is untouched: its patches are applied per forward
     (lowvram path; partially_unload restores and pops the backup when it
     moves a module there), so the payload change alone already took effect.
-    Returns the number of keys rewritten."""
+
+    Unlike Forge's load, this runs in the middle of sampling, after Forge
+    has set the VRAM budget for sampling. So each result is copied into the
+    live weight's own memory where it fits (``_fits_in_place``), and the merge
+    temporaries are handed back to the driver at the end: kept in
+    PyTorch's cache, they are VRAM the next stage cannot reuse, and with
+    the Windows sysmem fallback it spills to shared memory instead of
+    failing. Returns the number of keys rewritten."""
     import torch
     from backend import memory_management, utils as backend_utils
     from backend.float import stochastic_rounding
@@ -335,11 +342,11 @@ def _rebake_keys(patcher, keys):
         if not remaining:
             # Pure restore: mimic unpatch_model, the backup is the raw
             # original (quantized checkpoints included), set it back as-is.
-            restored = bk.weight.to(weight.device, copy=True)
-            if bk.inplace_update:
-                backend_utils.copy_to_param(patcher.model, key, restored)
+            if bk.inplace_update or _fits_in_place(weight, bk.weight, bk.weight):
+                backend_utils.copy_to_param(patcher.model, key, bk.weight)
             else:
-                backend_utils.set_attr(patcher.model, key, restored)
+                backend_utils.set_attr(patcher.model, key,
+                                       bk.weight.to(weight.device, copy=True))
             done += 1
             continue
         temp_dtype = memory_management.lora_compute_dtype(weight.device)
@@ -350,16 +357,35 @@ def _rebake_keys(patcher, keys):
         out = merge_lora_to_weight(remaining, temp, key)
         if set_func is None:
             out = stochastic_rounding(out, weight.dtype, seed=string_to_seed(key))
-            if bk.inplace_update:
+            if bk.inplace_update or _fits_in_place(weight, out, bk.weight):
                 backend_utils.copy_to_param(patcher.model, key, out)
             else:
                 backend_utils.set_attr(patcher.model, key, out)
         else:
             set_func(out, inplace_update=bk.inplace_update, seed=string_to_seed(key))
+        del temp, out
         done += 1
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    memory_management.soft_empty_cache()
     return done
+
+
+def _fits_in_place(live, value, backup) -> bool:
+    """Whether ``value`` can be copied into the live weight's memory: both
+    plain tensors of one dtype and shape, and the live weight sharing no
+    storage with the value or the backup (a write would change the backup).
+    A quantized tensor subclass keeps Forge's set_attr."""
+    plain = (torch.Tensor, torch.nn.Parameter)
+    if not (type(live) in plain and type(value) in plain
+            and live.dtype == value.dtype and live.shape == value.shape):
+        return False
+    return _storage_ptr(live) not in (_storage_ptr(value), _storage_ptr(backup))
+
+
+def _storage_ptr(tensor):
+    try:
+        return tensor.untyped_storage().data_ptr()
+    except Exception:    # a wrapper subclass with no storage of its own
+        return None
 
 
 def _set_baked_strength(unet, entries, scale: float) -> list:
