@@ -2,9 +2,10 @@
 
 Based on https://github.com/howardhx/speed
 Thin ComfyUI adapter over ``speed_core.sample_speed_core``: resolves the base
-solver from ``comfy.k_diffusion.sampling`` and exposes the node schema. The
-framework-agnostic math lives in ``speed_core.py`` (shared with the Forge Neo
-webui script in ``scripts/speed_forge.py``).
+solver the way KSamplerSelect does (``comfy.samplers.sampler_object``), or
+takes any SAMPLER object, and exposes the node schema. The framework-agnostic
+math lives in ``speed_core.py`` (shared with the Forge Neo webui script in
+``scripts/speed_forge.py``).
 """
 from __future__ import annotations
 
@@ -29,12 +30,83 @@ def _log(msg: str):
     print(f"[SPEED] {msg}")
 
 
+def _init_image_part(model, x, sigmas):
+    """Return the init image's contribution to ``x``, or ``None`` for txt2img.
+
+    ComfyUI's ``KSAMPLER.sample`` hands the sampler function a
+    ``KSamplerX0Inpaint`` whose ``latent_image`` is the clean latent (already
+    through ``process_latent_in``, zeros for an empty latent) and whose
+    ``inner_model`` is the guider holding the ``BaseModel``. The model's
+    ``noise_scaling`` with zero noise gives exactly the image part of ``x`` in
+    the model's own convention (``(1 - sigma) * latent`` for flow models).
+    """
+    latent = getattr(model, "latent_image", None)
+    if not isinstance(latent, torch.Tensor) or tuple(latent.shape) != tuple(x.shape):
+        return None
+    if not torch.count_nonzero(latent):
+        return None
+    latent = latent.to(device=x.device, dtype=x.dtype)
+    try:
+        model_sampling = model.inner_model.inner_model.model_sampling
+        return model_sampling.noise_scaling(sigmas[0], torch.zeros_like(x), latent, False)
+    except Exception:
+        s0 = float(sigmas[0])
+        return latent * (1.0 - s0) if s0 <= 1.0 else latent
+
+
+def _list_samplers() -> List[str]:
+    """Sampler names: the list KSamplerSelect shows, which other packs extend.
+
+    Read when the schema is built, so a pack loaded before this one (RES4LYF
+    inserts its names into this list) is included. Falls back to the
+    ``sample_*`` functions of the k-diffusion module.
+    """
+    try:
+        names = list(comfy.samplers.KSampler.SAMPLERS)
+    except Exception:
+        names = []
+    if not names:
+        names = [a[len("sample_"):] for a in dir(kds) if a.startswith("sample_")]
+    return names
+
+
+def _resolve_base(base_sampler: str, sampler=None):
+    """Return ``(sampler_object, label)`` for the base solver.
+
+    ``sampler`` is a connected SAMPLER object and wins over the name. A name
+    goes through ``comfy.samplers.sampler_object``, which also covers the
+    samplers that are not plain ``sample_*`` functions (``uni_pc``, ``ddim``,
+    ``dpm_fast``) and whatever other packs registered.
+    """
+    if sampler is None:
+        try:
+            sampler = comfy.samplers.sampler_object(base_sampler)
+        except Exception as e:
+            raise ValueError(f"Unknown base sampler {base_sampler!r}: {e}") from e
+        label = base_sampler
+    else:
+        fn = getattr(sampler, "sampler_function", None)
+        label = getattr(fn, "__name__", type(sampler).__name__).removeprefix("sample_")
+    fn = getattr(sampler, "sampler_function", None)
+    if not callable(fn):
+        raise ValueError(
+            f"SAMPLER {type(sampler).__name__} has no k-diffusion style sampler_function; "
+            "SPEED needs one to segment the schedule."
+        )
+    own_sample = getattr(type(sampler), "sample", None)
+    if own_sample is not None and own_sample is not comfy.samplers.KSAMPLER.sample:
+        _log(f"SAMPLER {type(sampler).__name__} overrides KSAMPLER.sample; SPEED runs its "
+             "sampler_function per segment and that override does not apply.")
+    return sampler, label
+
+
 @torch.no_grad()
 def sample_speed(
     model, x, sigmas, extra_args=None, callback=None, disable=None,
     *,
+    base=None,
+    base_label: str = "euler",
     transform: str = "dct",
-    base_sampler: str = "euler",
     mode: str = "delta_optimal",
     scales: List[float] = None,
     delta: float = 0.01,
@@ -46,16 +118,33 @@ def sample_speed(
     ref_latent: int = 128,
     ref_shift: float = None,
     log: bool = True,
+    noise_fill: str = "seed",
 ):
-    """Comfy-compatible ``sample_*`` function."""
-    sampler_fn = getattr(kds, f"sample_{base_sampler}", None)
-    if sampler_fn is None:
-        raise ValueError(f"Unknown base sampler {base_sampler!r}.")
+    """Comfy-compatible ``sample_*`` function.
 
+    ``base`` is the resolved base SAMPLER object: its ``sampler_function``
+    runs each segment with its ``extra_options`` as keyword arguments.
+    """
+    if base is None:
+        base, base_label = _resolve_base(base_label)
+    sampler_fn = base.sampler_function
+    sampler_kwargs = dict(getattr(base, "extra_options", {}) or {})
+
+    if extra_args is not None and extra_args.get("denoise_mask") is not None:
+        # A noise mask is blended against the full-resolution latent after
+        # every step; a coarse segment cannot honour it. Run the base sampler.
+        if log:
+            _log("noise mask present (masked / inpaint denoising); SPEED skipped for this pass.")
+        return sampler_fn(model, x, sigmas, extra_args=extra_args,
+                          callback=callback, disable=disable, **sampler_kwargs)
+
+    init_image = _init_image_part(model, x, sigmas)
     if log:
         _log(f"pass start: x={tuple(x.shape)}, steps={len(sigmas) - 1}, "
              f"sigmas {float(sigmas[0]):.4f}->{float(sigmas[-2]):.4f}, "
-             f"mode={mode}, transform={transform}, scales={scales}, seed={seed}")
+             f"sampler={base_label}, mode={mode}, transform={transform}, "
+             f"scales={scales}, seed={seed}"
+             + (", img2img" if init_image is not None else ""))
 
     return sample_speed_core(
         sampler_fn, model, x, sigmas,
@@ -65,23 +154,16 @@ def sample_speed(
         manual_sigmas=manual_sigmas, seed=seed,
         adaptive_delta=adaptive_delta, ref_latent=ref_latent,
         ref_shift=ref_shift,
+        sampler_kwargs=sampler_kwargs,
         log_fn=_log if log else None,
+        init_image=init_image,
+        noise_fill=noise_fill,
     )
 
 
 # =============================================================================
 # Comfy node
 # =============================================================================
-
-def _list_samplers() -> List[str]:
-    """Return supported k-diffusion sampler names."""
-    excluded = {"dpm_fast", "dpm_adaptive", "lcm"}
-    try:
-        names = [a[len("sample_"):] for a in dir(kds) if a.startswith("sample_")]
-    except Exception:
-        names = ["euler", "euler_ancestral", "heun", "dpmpp_2m", "uni_pc"]
-    return sorted(n for n in names if n not in excluded)
-
 
 class SamplerSPEED(io.ComfyNode):
     """Spectral Progressive Diffusion sampler node."""
@@ -95,9 +177,10 @@ class SamplerSPEED(io.ComfyNode):
             inputs=[
                 io.Combo.Input(
                     "base_sampler", options=_list_samplers(), default="euler",
-                    tooltip="Underlying ODE solver. Any comfy k_diffusion sampler is "
-                            "supported. Multistep solvers restart "
-                            "at each SPEED transition because we segment the schedule.",
+                    tooltip="Underlying solver, from the same list KSamplerSelect offers "
+                            "(other packs' samplers included). Multistep solvers restart "
+                            "at each SPEED transition because the schedule is segmented. "
+                            "Ignored when a SAMPLER is connected to `sampler`.",
                 ),
                 io.Combo.Input(
                     "transform", options=["dct", "dwt", "fft"], default="dct",
@@ -168,7 +251,8 @@ class SamplerSPEED(io.ComfyNode):
                 ),
                 io.Int.Input(
                     "seed", default=0, min=0, max=2**31 - 1, step=1,
-                    tooltip="Seed for the spectral-noise padding at each transition.",
+                    tooltip="Seed for the spectral-noise padding at each transition, when "
+                            "`noise_fill` is `fresh` (and always for the dwt transform).",
                 ),
                 io.Boolean.Input(
                     "log", default=True,
@@ -179,6 +263,22 @@ class SamplerSPEED(io.ComfyNode):
                             "the transition where you expect at your actual resolution "
                             "and step count.",
                 ),
+                io.Combo.Input(
+                    "noise_fill", options=["seed", "fresh"], default="seed",
+                    tooltip="Where the noise that fills each newly opened band at a "
+                            "transition comes from. `seed`: the run's own seed noise, so "
+                            "every band of every stage carries the noise a plain run at "
+                            "this seed uses and the output matches that run as closely as "
+                            "the coarse pass allows. `fresh`: new noise from `seed` at "
+                            "each transition (the dwt transform always does this).",
+                ),
+                io.Sampler.Input(
+                    "sampler", optional=True,
+                    tooltip="Optional base solver as a SAMPLER object (KSamplerSelect, "
+                            "RES4LYF's ClownSampler, any custom sampler node). When "
+                            "connected it replaces `base_sampler`: its sampler function "
+                            "runs each segment with its own options.",
+                ),
             ],
             outputs=[io.Sampler.Output()],
         )
@@ -186,7 +286,7 @@ class SamplerSPEED(io.ComfyNode):
     @classmethod
     def execute(cls, base_sampler, transform, mode, model_preset, scales,
                 adaptive_delta, delta, manual_sigmas, spectrum_A, spectrum_beta,
-                seed, log):
+                seed, log, noise_fill="seed", sampler=None):
         preset = _PRESETS.get(model_preset)
         if preset is not None:
             A, beta = preset["A"], preset["beta"]
@@ -201,12 +301,14 @@ class SamplerSPEED(io.ComfyNode):
 
         parsed_scales = _parse_scales(scales)
         parsed_sigmas = _parse_sigmas(manual_sigmas) if mode == "manual" else []
+        base, base_label = _resolve_base(base_sampler, sampler)
 
-        sampler = comfy.samplers.KSAMPLER(
+        wrapped = comfy.samplers.KSAMPLER(
             sample_speed,
             extra_options={
+                "base": base,
+                "base_label": base_label,
                 "transform": transform,
-                "base_sampler": base_sampler,
                 "mode": mode,
                 "scales": parsed_scales,
                 "delta": float(delta),
@@ -218,6 +320,10 @@ class SamplerSPEED(io.ComfyNode):
                 "ref_latent": int(ref_latent),
                 "ref_shift": ref_shift,
                 "log": bool(log),
+                "noise_fill": noise_fill,
             },
+            # ddim is euler with ComfyUI's random inpaint noise; keep whatever
+            # the base object asked for.
+            inpaint_options=dict(getattr(base, "inpaint_options", {}) or {}),
         )
-        return io.NodeOutput(sampler)
+        return io.NodeOutput(wrapped)

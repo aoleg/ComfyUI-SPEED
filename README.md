@@ -25,6 +25,13 @@ Workflow:
 1. Place this folder under your ComfyUI `custom_nodes` directory, then restart ComfyUI.
 2. Connect the **Sampler SPEED (Spectral Progressive Diffusion)** output to **SamplerCustomAdvanced**.
 
+Notes for the ComfyUI node:
+
+- **Any sampler.** `base_sampler` lists what KSamplerSelect lists and resolves names the same way, so `uni_pc`, `ddim`, `dpm_fast` and the names other packs register (RES4LYF) all work. Sampler nodes that output a SAMPLER object (ClownSampler and friends) connect to the optional `sampler` input instead. Each SPEED stage is a separate call of the sampler function, so multistep solvers restart their history at every transition, and every stage needs at least two steps. A sampler option that carries its own schedule (`sigmas_override`) cannot be segmented; such a pass runs unsegmented with a console line.
+- **Transition noise.** With `noise_fill` = `seed` (the default) every band the expansion opens is filled from the run's own seed noise, transformed once, so all stages carry the noise realisation a plain run at this seed uses and the output converges to that run as the transition moves earlier. `fresh` draws new noise from `seed` at each transition, as earlier versions did.
+- **Image-to-image** works as with any sampler: a VAE-encoded latent with a `denoise` below 1 (BasicScheduler) seeds the first stage with the image low-passed to that stage's size, at its own level. A pass whose schedule already starts below a transition sigma has no coarse steps to run; that transition is dropped and the pass runs at the next scale up, with a console line saying so.
+- **Masked denoising** (a latent with a noise mask) is skipped: the mask is blended against the full-resolution latent after every step, which a coarse segment cannot honour. The base sampler runs instead.
+
 ## Usage (Forge Neo / sd-webui-forge-classic)
 
 The same repo doubles as a webui extension — the shared math lives in `speed_core.py`, the webui integration in `scripts/speed_forge.py`.
@@ -37,8 +44,11 @@ Notes for the webui version:
 
 - Designed for **flow-matching models** (Flux, Wan, Krea 2, Z-Image, …) whose sigmas are in `(0, 1]`. eps-prediction models (SD1.x/SDXL) run but are unvalidated and currently produce soft results — `docs/sdxl-analysis.md` explains why. In `manual` mode thresholds above 1.0 are accepted for such schedules.
 - **Inpainting** is automatically skipped (masks and inpaint image conditioning are tied to the full latent resolution).
-- The **hires-fix pass** is untouched unless "Apply to hires-fix pass" is checked.
+- **img2img** seeds the first stage with the init image low-passed to that stage's size, at its own level, plus the seed noise at coarse size. A pass whose schedule already starts below a transition sigma (a low denoising strength) has no coarse steps to run; that transition is dropped and the pass runs at the next scale up, with a console line saying so.
+- The **hires-fix pass** is untouched unless "Apply to hires-fix pass" is checked; when it is, the pass is an img2img pass and the two points above apply.
+- **Any sampler** the webui offers works, including the ones extensions add (the Extra Samplers pack and its RES4LYF port): SPEED wraps whatever function the selected sampler installed and forwards its own options to every segment. Multistep solvers restart their history at each transition, and every stage needs at least two steps. A sampler option that carries its own schedule (`sigmas_override`) cannot be segmented; the pass runs unsegmented with a console line. DDIM and PLMS take timesteps rather than sigmas and are left alone.
 - Brownian-noise samplers (DPM++ SDE family) work, but their pre-built noise sampler is only used on the full-resolution segment; coarse segments fall back to the sampler's default noise.
+- **Transition noise** (`seed`, the default) fills each band the expansion opens from the run's own seed noise, so the output matches a plain run at the same seed as closely as the coarse pass allows. `fresh` draws new noise from the spectral noise seed at each transition, as earlier versions did; the `dwt` transform always does. The infotext records `fill=seed` or `fill=fresh`.
 - The `dwt` transform needs the optional `PyWavelets` package (`pip install PyWavelets` into the webui venv); `dct` (default) and `fft` have no extra dependencies.
 - If a transition threshold is never reached (too few steps / too small `delta`), the console warns and the output stays at the coarse resolution — increase steps or `delta`.
 - Settings are recorded in the image infotext under the `SPEED:` key.
@@ -89,14 +99,17 @@ Notes for the SwarmUI version:
 - When SPEED is enabled, the main sampling node is rebuilt as a `SamplerCustomAdvanced` + `SamplerSPEED` graph. Swarm-specific sampler features — **Variation Seed** and tiled sampling — do not apply while SPEED is on, and live previews may behave differently.
 - Swarm-custom schedulers (`align_your_steps`, `flux2`, `ltxv`, `ideogram4`, ...) can't be rebuilt from stock Comfy nodes; SPEED falls back to `simple` for those (with a log warning). `turbo`, `karras`, and all standard Comfy schedulers are reproduced faithfully.
 - **Masked generations** (inpainting / regional masks) are automatically skipped, and the **Refiner stage** is untouched.
-- The base **Sampler** must be a k-diffusion sampler (Euler, DPM++ 2M, etc.). Exotic non-k-diffusion samplers (`ddim`, `uni_pc`, `res_multistep`) are rejected by the node with a clear error — pick another sampler.
+- Any **Sampler** Swarm lists works as the base solver, including names other node packs register on the backend (RES4LYF); the node resolves them the way SwarmKSampler does. Swarm's own parameters that have no SPEED counterpart are ignored.
+- **[SPEED] Transition Noise** chooses between the run's seed noise (default, matches a plain run at the same seed) and fresh noise per transition; see the ComfyUI notes.
 - The SPEED parameters are recorded in the image metadata like all Swarm params.
 
 ## Inputs
 
 | Input | Type | Default | Description |
 |---|---|---|---|
-| `base_sampler` | combo | `euler` | Underlying ODE solver. Any `comfy.k_diffusion.sampling` sampler supported. |
+| `base_sampler` | combo | `euler` | Underlying solver, from the same list KSamplerSelect offers, other packs' samplers included (RES4LYF registers its names there). Ignored when `sampler` is connected. |
+| `sampler` | SAMPLER (optional) | — | A base solver as a SAMPLER object (KSamplerSelect, RES4LYF's ClownSampler, any custom sampler node). Its sampler function runs each segment with its own options. |
+| `noise_fill` | combo | `seed` | Where the noise that fills a newly opened band at a transition comes from. `seed`: the run's own seed noise, so the output matches a plain run at the same seed as closely as the coarse pass allows. `fresh`: new noise from `seed` at each transition (`dwt` always). |
 | `transform` | combo | `dct` | Spectral basis for expansion: `dct` (any ratio), `dwt` (2× only), `fft` (any ratio). |
 | `mode` | combo | `delta_optimal` | `delta_optimal` computes transitions from the power-spectrum preset. `manual` uses user-specified sigma thresholds. |
 | `model_preset` | combo | `flux` | Power-spectrum preset: `flux`, `wan21`, `krea-2`, `krea-2-raw`, `z-image`, `flux2`, `anima`, or `custom` (use `spectrum_A` / `spectrum_beta`). See [Model presets](#model-presets). |
@@ -106,7 +119,7 @@ Notes for the SwarmUI version:
 | `manual_sigmas` | string | `0.85` | Comma-separated sigma thresholds (one per transition). Used in `manual` mode. |
 | `spectrum_A` | float | `203.615` | Power-law amplitude (used when `model_preset=custom`). |
 | `spectrum_beta` | float | `1.915` | Power-law decay exponent (used when `model_preset=custom`). |
-| `seed` | int | `0` | Seed for spectral-noise padding at each transition. |
+| `seed` | int | `0` | Seed for the spectral-noise padding at each transition, with `noise_fill` = `fresh`. |
 | `log` | bool | `true` | Print the resolved transition step(s) and sigma(s) to the console every run, e.g. `[SPEED] transitions: step 8: 0.5->1 (sigma=0.8473)`. The fastest way to check a preset/delta landed where you expect at your actual resolution and step count. |
 
 ### delta_optimal mode (recommended)
