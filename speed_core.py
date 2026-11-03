@@ -15,16 +15,17 @@ from __future__ import annotations
 import math
 from typing import Callable, List, Optional, Tuple
 
-import numpy as np
 import torch
 
 from .spectral_utils import (
-    _dct_expand_np,
     _dwt_expand_np,
-    _fft_expand_np,
     align_timestep,
+    dct2,
+    dct_expand,
+    dct_truncate,
     delta_optimal_transitions,
     equivalent_delta,
+    fft_expand,
     kappa,
     reference_coarse_fraction,
     validate_scales,
@@ -300,76 +301,63 @@ def _parse_sigmas(s: str, upper: Optional[float] = 1.0) -> List[float]:
 # Spectral transition helper.
 # =============================================================================
 
+def _fold_frames(x: torch.Tensor) -> torch.Tensor:
+    """Fold a 5D video latent's frames into the batch axis; 4D passes through."""
+    if x.ndim == 5:
+        B, C, T_frames, H, W = x.shape
+        return x.permute(0, 2, 1, 3, 4).reshape(B * T_frames, C, H, W)
+    if x.ndim == 4:
+        return x
+    raise ValueError(f"expected 4D or 5D latent, got shape {tuple(x.shape)}")
+
+
+def _unfold_frames(x4: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    """Undo ``_fold_frames`` for the layout of ``like``, casting to its dtype."""
+    x4 = x4.to(dtype=like.dtype)
+    if like.ndim == 5:
+        B, C, T_frames = like.shape[:3]
+        return x4.reshape(B, T_frames, C, x4.shape[-2], x4.shape[-1]).permute(0, 2, 1, 3, 4)
+    return x4
+
+
 def _expand_and_align_torch(
     x: torch.Tensor, s_i: float, s_next: float, t: float,
     transform: str, seed: int, H_full: int, W_full: int,
+    fill: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, float]:
-    """Expand a 4D image latent or 5D video latent over its spatial axes."""
+    """Expand a 4D image latent or 5D video latent over its spatial axes.
+
+    ``fill`` is the coupled-noise field in the transform's own domain (see
+    ``sample_speed_core``), already folded like ``_fold_frames``; ``dwt``
+    cannot use it and draws fresh noise.
+    """
     if transform not in ("dct", "dwt", "fft"):
         raise ValueError(f"transform must be dct|dwt|fft, got {transform!r}")
     r = s_next / s_i
     H_tgt = round(s_next * H_full)
     W_tgt = round(s_next * W_full)
 
-    if x.ndim == 5:
-        B, C, T_frames, h_lo, w_lo = x.shape
-        x4 = x.permute(0, 2, 1, 3, 4).reshape(B * T_frames, C, h_lo, w_lo)
-    elif x.ndim == 4:
-        x4 = x
-    else:
-        raise ValueError(f"expected 4D or 5D latent, got shape {tuple(x.shape)}")
-
-    x_np = x4.detach().cpu().float().numpy()
+    x4 = _fold_frames(x).float()
     if transform == "dwt":
         if abs(r - 2.0) > 1e-6:
             raise ValueError(
                 f"DWT requires r=2 between consecutive scales; got r={r:.4f}. "
                 "Use transform=dct or transform=fft for non-dyadic ratios."
             )
-        expanded = _dwt_expand_np(x_np, t, seed)
+        expanded = torch.from_numpy(
+            _dwt_expand_np(x4.detach().cpu().numpy(), t, seed)
+        ).to(x.device)
     elif transform == "dct":
-        expanded = _dct_expand_np(x_np, (H_tgt, W_tgt), t, seed)
+        expanded = dct_expand(x4, (H_tgt, W_tgt), t, seed, fill=fill)
     else:
-        expanded = _fft_expand_np(x_np, (H_tgt, W_tgt), t, seed)
+        expanded = fft_expand(x4, (H_tgt, W_tgt), t, seed, fill=fill)
 
-    rescaled = (kappa(t, r) * expanded).astype(np.float32)
-    x4_new = torch.from_numpy(rescaled).to(device=x.device, dtype=x.dtype)
-
-    if x.ndim == 5:
-        out = x4_new.reshape(B, T_frames, C, H_tgt, W_tgt).permute(0, 2, 1, 3, 4)
-    else:
-        out = x4_new
-
-    return out, align_timestep(t, r)
+    return _unfold_frames(kappa(t, r) * expanded, x), align_timestep(t, r)
 
 
 # =============================================================================
 # Initial coarse-resolution latent.
 # =============================================================================
-
-def _fold_frames(x: torch.Tensor) -> torch.Tensor:
-    """Fold a 5D video latent's frames into the batch axis; 4D passes through."""
-    if x.ndim == 5:
-        B, C, T_frames, H, W = x.shape
-        return x.permute(0, 2, 1, 3, 4).reshape(B * T_frames, C, H, W)
-    return x
-
-
-def _dct_truncate_np(x_np: np.ndarray, H_lo: int, W_lo: int) -> np.ndarray:
-    """Keep the ``H_lo x W_lo`` low band of an orthonormal DCT, per 2D slice.
-
-    Per coefficient this is the identity, so white noise keeps its variance.
-    Smooth content does not keep its level: the DC coefficient of an ortho
-    DCT is ``mean * sqrt(H*W)``, so a constant comes back scaled by
-    ``sqrt(H*W / (H_lo*W_lo))`` -- ``1/s`` for a uniform scale ``s``.
-    """
-    from scipy.fft import dctn, idctn
-    out_np = np.empty(x_np.shape[:-2] + (H_lo, W_lo), dtype=np.float32)
-    for idx in np.ndindex(*x_np.shape[:-2]):
-        coeffs = dctn(x_np[idx], type=2, norm="ortho")
-        out_np[idx] = idctn(coeffs[:H_lo, :W_lo], type=2, norm="ortho").astype(np.float32)
-    return out_np
-
 
 def _initial_dct_downscale(
     x: torch.Tensor, scale: float, init_image: Optional[torch.Tensor] = None,
@@ -379,7 +367,7 @@ def _initial_dct_downscale(
     ``x`` is the sampler's starting latent. For txt2img it is pure noise and
     truncation alone is right: every kept coefficient keeps its variance. For
     img2img it is ``noise + image`` in the backend's convention, and the
-    truncation's gain on the image part (``1/s``, see ``_dct_truncate_np``)
+    truncation's gain on the image part (``1/s``, see ``dct_truncate``)
     would start the coarse pass from an image ``1/s`` times too strong. With
     ``init_image`` -- the image's contribution to ``x``, at full resolution --
     the two parts are truncated separately: the noise as is, the image with a
@@ -391,25 +379,18 @@ def _initial_dct_downscale(
     H_full, W_full = x.shape[-2], x.shape[-1]
     H_lo, W_lo = round(H_full * scale), round(W_full * scale)
 
-    x4 = _fold_frames(x)
-    x_np = x4.detach().cpu().float().numpy()
+    x4 = _fold_frames(x).float()
     if init_image is not None and torch.count_nonzero(init_image):
         if tuple(init_image.shape) != tuple(x.shape):
             raise ValueError(
                 f"init_image shape {tuple(init_image.shape)} must match x {tuple(x.shape)}"
             )
-        img_np = _fold_frames(init_image).detach().cpu().float().numpy()
+        img4 = _fold_frames(init_image).to(device=x.device, dtype=torch.float32)
         gain = math.sqrt((H_lo * W_lo) / (H_full * W_full))
-        out_np = (_dct_truncate_np(x_np - img_np, H_lo, W_lo)
-                  + gain * _dct_truncate_np(img_np, H_lo, W_lo))
+        out4 = dct_truncate(x4 - img4, H_lo, W_lo) + gain * dct_truncate(img4, H_lo, W_lo)
     else:
-        out_np = _dct_truncate_np(x_np, H_lo, W_lo)
-    out4 = torch.from_numpy(out_np.astype(np.float32)).to(device=x.device, dtype=x.dtype)
-
-    if x.ndim == 5:
-        B, C, T_frames, _, _ = x.shape
-        return out4.reshape(B, T_frames, C, H_lo, W_lo).permute(0, 2, 1, 3, 4)
-    return out4
+        out4 = dct_truncate(x4, H_lo, W_lo)
+    return _unfold_frames(out4, x)
 
 
 # =============================================================================
@@ -658,6 +639,21 @@ def _plan_manual(
 # Segmented sampling.
 # =============================================================================
 
+def schedule_override(sampler_kwargs: dict) -> Optional[str]:
+    """Return the name of a sampler option that replaces the sigma schedule.
+
+    Some samplers take their own schedule as an option (RES4LYF's
+    ``sigmas_override``) and ignore the ``sigmas`` they are called with. Each
+    SPEED segment would then run the whole override at its own resolution, so
+    such a pass has to run unsegmented. Any option whose name starts with
+    ``sigmas`` and holds a tensor counts.
+    """
+    for name, value in (sampler_kwargs or {}).items():
+        if name.startswith("sigmas") and isinstance(value, torch.Tensor):
+            return name
+    return None
+
+
 def _segment_callback(outer_cb, segment_start_idx: int, index_map=None):
     """Re-base callback step indices to the full schedule.
 
@@ -702,6 +698,7 @@ def sample_speed_core(
     log_fn: Callable[[str], None] = None,
     segment_hook: Callable = None,
     init_image: Optional[torch.Tensor] = None,
+    noise_fill: str = "seed",
 ):
     """Run ``sampler_fn`` segment-by-segment with spectral expansion in between.
 
@@ -738,12 +735,31 @@ def sample_speed_core(
     space as ``x`` -- what the backend's noise scaling adds to the noise, e.g.
     ``(1 - sigma[0]) * init_latent`` for a flow model. ``None`` or zeros means
     ``x`` is pure noise. See ``_initial_dct_downscale`` for why it matters.
+
+    ``noise_fill`` decides where the noise that fills a newly opened band at
+    each transition comes from. ``"seed"`` (the default) takes it from the
+    run's own seed noise: the full-resolution field is recovered as
+    ``(x - init_image) / sigma[0]`` (exact in the flow and eps conventions),
+    transformed once, and the band a transition opens is that field's
+    coefficients times ``t``. Every band of every stage then carries the same
+    noise realisation a plain run at this seed uses, so the output converges
+    to the plain run as the transition moves earlier and a same-seed A/B
+    measures the coarse pass alone. ``"fresh"`` draws new noise from ``seed``
+    at each transition, as before. The ``dwt`` transform has no cheap band
+    decomposition of the field and always draws fresh noise.
     """
     extra_args = {} if extra_args is None else extra_args
     sampler_kwargs = dict(sampler_kwargs or {})
     full_res_sampler_kwargs = dict(full_res_sampler_kwargs or {})
 
     H_full, W_full = x.shape[-2], x.shape[-1]
+
+    override = schedule_override(sampler_kwargs)
+    if override is not None:
+        if log_fn is not None:
+            log_fn(f"sampler option {override!r} carries its own sigma schedule, which "
+                   "SPEED cannot segment; running the pass unsegmented at full resolution.")
+        scales = None
 
     if not scales or len(scales) < 2:
         return sampler_fn(model, x, sigmas, extra_args=extra_args,
@@ -788,6 +804,26 @@ def sample_speed_core(
                 "or the manual sigma thresholds."
             )
 
+    if noise_fill not in ("seed", "fresh"):
+        raise ValueError(f"noise_fill must be seed|fresh, got {noise_fill!r}")
+    fill = None
+    if transitions and noise_fill == "seed":
+        if transform == "dwt":
+            if log_fn is not None:
+                log_fn("noise fill: the dwt transform cannot reuse the seed noise; "
+                       "drawing fresh noise at each transition")
+        elif float(sigmas[0]) > 0.0:
+            field = x
+            if init_image is not None and torch.count_nonzero(init_image):
+                field = x - init_image.to(device=x.device, dtype=x.dtype)
+            field = _fold_frames(field).float() / float(sigmas[0])
+            if transform == "dct":
+                fill = dct2(field)
+            else:
+                fill = torch.fft.fftshift(torch.fft.fft2(field, norm="ortho"), dim=(-2, -1))
+            if log_fn is not None:
+                log_fn("noise fill: seed (each opened band comes from the run's own seed noise)")
+
     # DCT-truncate the incoming latent down to the coarsest scale.
     if first_scale < 1.0:
         x = _initial_dct_downscale(x, first_scale, init_image)
@@ -819,7 +855,7 @@ def sample_speed_core(
         x, t_tilde = _expand_and_align_torch(
             x, s_i, s_next, sigma_at_transition,
             transform=transform, seed=seed + (seg_i + 1) * 10000,
-            H_full=H_full, W_full=W_full,
+            H_full=H_full, W_full=W_full, fill=fill,
         )
 
         # Patch only the transition sigma, matching the reference inference loop.

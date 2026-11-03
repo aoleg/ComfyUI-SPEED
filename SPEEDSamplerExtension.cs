@@ -19,7 +19,7 @@ public class SPEEDSamplerExtension : Extension
     public const string RepoUrl = "https://github.com/aoleg/ComfyUI-SPEED";
 
     /// <summary>Node inputs this extension sends that older node packs do not have. Used only to warn about a version mismatch.</summary>
-    public static string[] RequiredNodeInputs = ["adaptive_delta", "log"];
+    public static string[] RequiredNodeInputs = ["adaptive_delta", "log", "noise_fill"];
 
     /// <summary>Presets offered here, as "id///Display Name". The ids must match the node's own preset table (_PRESETS in speed_core.py) - kept in one place so the mismatch check below has something to compare against.</summary>
     public static string[] ModelPresets =
@@ -34,7 +34,7 @@ public class SPEEDSamplerExtension : Extension
         "custom///Custom (A / beta below)"
     ];
 
-    public static T2IRegisteredParam<string> Transform, Mode, ModelPreset, Scales, ManualSigmas;
+    public static T2IRegisteredParam<string> Transform, Mode, ModelPreset, Scales, ManualSigmas, NoiseFill;
 
     public static T2IRegisteredParam<double> Delta, SpectrumA, SpectrumBeta;
 
@@ -139,8 +139,12 @@ public class SPEEDSamplerExtension : Extension
         SpectrumBeta = T2IParamTypes.Register<double>(new("[SPEED] Spectrum Beta", "[SPEED]\nPower-law decay exponent 'beta' of the latent power spectrum.\nOnly used when '[SPEED] Model Preset' is 'custom'.",
             "1.915461", Min: 0, Max: 10, Step: 0.001, Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 8
             ));
-        SpectralSeed = T2IParamTypes.Register<long>(new("[SPEED] Spectral Noise Seed", "[SPEED]\nSeed for the spectral-noise padding applied at each transition.\n'-1' follows the generation seed.",
+        SpectralSeed = T2IParamTypes.Register<long>(new("[SPEED] Spectral Noise Seed", "[SPEED]\nSeed for the spectral-noise padding applied at each transition, when '[SPEED] Transition Noise' is 'fresh' (and always for the DWT transform).\n'-1' follows the generation seed.",
             "-1", Min: -1, Max: int.MaxValue, Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 9
+            ));
+        NoiseFill = T2IParamTypes.Register<string>(new("[SPEED] Transition Noise", "[SPEED]\nWhere the noise that fills each newly opened frequency band at a resolution transition comes from.\n'seed' (default): the run's own seed noise, so every band of every stage carries the noise a plain run at this seed uses and the output matches that run as closely as the coarse pass allows.\n'fresh': new noise from '[SPEED] Spectral Noise Seed' at each transition (the DWT transform always does this).",
+            "seed", Group: SpeedGroup, FeatureFlag: FeatureId, OrderPriority: 9.5,
+            GetValues: (_) => ["seed///Seed noise (matches a plain run)", "fresh///Fresh noise per transition"]
             ));
         // Runs just after the main sampler step (-5), before the refiner (-4): rewrites the main
         // sampler node in place so all downstream connections to it remain valid.
@@ -231,6 +235,7 @@ public class SPEEDSamplerExtension : Extension
                 ["spectrum_A"] = g.UserInput.Get(SpectrumA, 203.615097),
                 ["spectrum_beta"] = g.UserInput.Get(SpectrumBeta, 1.915461),
                 ["seed"] = spectralSeed % int.MaxValue,
+                ["noise_fill"] = g.UserInput.Get(NoiseFill, "seed"),
                 ["log"] = true
             });
         }

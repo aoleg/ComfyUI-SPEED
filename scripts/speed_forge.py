@@ -911,6 +911,7 @@ def _make_speed_func(base_fn, cfg: dict):
                 ref_shift=cfg["ref_shift"], sigma_divisor=cfg["sigma_divisor"],
                 sampler_kwargs=kwargs, full_res_sampler_kwargs=full_res_kwargs,
                 log_fn=_log, segment_hook=hook, init_image=init_image,
+                noise_fill=cfg.get("noise_fill", "seed"),
             )
         finally:
             kds.torch = prev_torch
@@ -1023,6 +1024,13 @@ class SpeedForgeScript(scripts.Script):
                 transform = gr.Radio(
                     choices=["dct", "dwt", "fft"], value="dct", label="Transform",
                     info="Spectral basis at each transition. DWT needs 2x scale steps and PyWavelets.",
+                )
+                noise_fill = gr.Radio(
+                    choices=["seed", "fresh"], value="seed", label="Transition noise",
+                    info="Where the noise that fills each newly opened band comes from. "
+                         "seed: the run's own seed noise, so the output matches a plain "
+                         "run at the same seed as closely as the coarse pass allows. "
+                         "fresh: new noise from the spectral noise seed below (DWT always).",
                 )
                 mode = gr.Radio(
                     choices=["neo_shift", "delta_optimal", "manual"], value="neo_shift",
@@ -1139,10 +1147,12 @@ class SpeedForgeScript(scripts.Script):
 
         self._wire_cfg_unlock(enabled, diversity_enabled)
 
+        # noise_fill is appended last so the positional argument order the
+        # earlier controls established (and before_process_batch indexes) holds.
         return [enabled, transform, mode, model_preset, scales, adaptive_delta,
                 delta, sigma_divisor, manual_sigmas, spectrum_A, spectrum_beta,
                 seed, apply_hr, diversity_enabled, diversity_cfg,
-                diversity_pattern, diversity_bake]
+                diversity_pattern, diversity_bake, noise_fill]
 
     @staticmethod
     def _resolve_diversity(p, enabled, raw_cfg, pattern, bake=True):
@@ -1265,7 +1275,7 @@ class SpeedForgeScript(scripts.Script):
                        manual_sigmas, spectrum_A, spectrum_beta, seed,
                        apply_hr, diversity_enabled=False,
                        diversity_cfg=4.5, diversity_pattern="turbo",
-                       diversity_bake=True, *args, **kwargs):
+                       diversity_bake=True, noise_fill="seed", *args, **kwargs):
         cls = SpeedForgeScript
         cls.enabled = bool(enabled)
         cls.config = None
@@ -1324,6 +1334,7 @@ class SpeedForgeScript(scripts.Script):
             "ref_latent": int(ref_latent),
             "ref_shift": ref_shift,
             "sigma_divisor": resolved_divisor,
+            "noise_fill": noise_fill if noise_fill in ("seed", "fresh") else "seed",
         }
 
         p.extra_generation_params["SPEED"] = (
@@ -1331,7 +1342,7 @@ class SpeedForgeScript(scripts.Script):
             + ("adaptive " if adaptive_delta and core_mode == "delta_optimal" else "")
             + (f"sigma_divisor={sigma_divisor} " if mode == "neo_shift" else "")
             + (f"manual_sigmas={manual_sigmas} " if mode == "manual" else "")
-            + f"seed={seed}"
+            + f"fill={cls.config['noise_fill']} seed={seed}"
         )
 
         cls.diversity = self._resolve_diversity(
