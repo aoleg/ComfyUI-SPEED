@@ -347,29 +347,67 @@ def _expand_and_align_torch(
 # Initial coarse-resolution latent.
 # =============================================================================
 
-def _initial_dct_downscale(x: torch.Tensor, scale: float) -> torch.Tensor:
-    """Downscale ``x`` by DCT truncation."""
+def _fold_frames(x: torch.Tensor) -> torch.Tensor:
+    """Fold a 5D video latent's frames into the batch axis; 4D passes through."""
+    if x.ndim == 5:
+        B, C, T_frames, H, W = x.shape
+        return x.permute(0, 2, 1, 3, 4).reshape(B * T_frames, C, H, W)
+    return x
+
+
+def _dct_truncate_np(x_np: np.ndarray, H_lo: int, W_lo: int) -> np.ndarray:
+    """Keep the ``H_lo x W_lo`` low band of an orthonormal DCT, per 2D slice.
+
+    Per coefficient this is the identity, so white noise keeps its variance.
+    Smooth content does not keep its level: the DC coefficient of an ortho
+    DCT is ``mean * sqrt(H*W)``, so a constant comes back scaled by
+    ``sqrt(H*W / (H_lo*W_lo))`` -- ``1/s`` for a uniform scale ``s``.
+    """
+    from scipy.fft import dctn, idctn
+    out_np = np.empty(x_np.shape[:-2] + (H_lo, W_lo), dtype=np.float32)
+    for idx in np.ndindex(*x_np.shape[:-2]):
+        coeffs = dctn(x_np[idx], type=2, norm="ortho")
+        out_np[idx] = idctn(coeffs[:H_lo, :W_lo], type=2, norm="ortho").astype(np.float32)
+    return out_np
+
+
+def _initial_dct_downscale(
+    x: torch.Tensor, scale: float, init_image: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Downscale ``x`` by DCT truncation.
+
+    ``x`` is the sampler's starting latent. For txt2img it is pure noise and
+    truncation alone is right: every kept coefficient keeps its variance. For
+    img2img it is ``noise + image`` in the backend's convention, and the
+    truncation's gain on the image part (``1/s``, see ``_dct_truncate_np``)
+    would start the coarse pass from an image ``1/s`` times too strong. With
+    ``init_image`` -- the image's contribution to ``x``, at full resolution --
+    the two parts are truncated separately: the noise as is, the image with a
+    ``sqrt(area ratio)`` gain that restores its level.
+    """
     if scale >= 1.0:
         return x
 
     H_full, W_full = x.shape[-2], x.shape[-1]
     H_lo, W_lo = round(H_full * scale), round(W_full * scale)
 
+    x4 = _fold_frames(x)
+    x_np = x4.detach().cpu().float().numpy()
+    if init_image is not None and torch.count_nonzero(init_image):
+        if tuple(init_image.shape) != tuple(x.shape):
+            raise ValueError(
+                f"init_image shape {tuple(init_image.shape)} must match x {tuple(x.shape)}"
+            )
+        img_np = _fold_frames(init_image).detach().cpu().float().numpy()
+        gain = math.sqrt((H_lo * W_lo) / (H_full * W_full))
+        out_np = (_dct_truncate_np(x_np - img_np, H_lo, W_lo)
+                  + gain * _dct_truncate_np(img_np, H_lo, W_lo))
+    else:
+        out_np = _dct_truncate_np(x_np, H_lo, W_lo)
+    out4 = torch.from_numpy(out_np.astype(np.float32)).to(device=x.device, dtype=x.dtype)
+
     if x.ndim == 5:
         B, C, T_frames, _, _ = x.shape
-        x4 = x.permute(0, 2, 1, 3, 4).reshape(B * T_frames, C, H_full, W_full)
-    else:
-        x4 = x
-
-    x_np = x4.detach().cpu().float().numpy()
-    from scipy.fft import dctn, idctn
-    out_np = np.empty(x_np.shape[:-2] + (H_lo, W_lo), dtype=np.float32)
-    for idx in np.ndindex(*x_np.shape[:-2]):
-        coeffs = dctn(x_np[idx], type=2, norm="ortho")
-        out_np[idx] = idctn(coeffs[:H_lo, :W_lo], type=2, norm="ortho").astype(np.float32)
-    out4 = torch.from_numpy(out_np).to(device=x.device, dtype=x.dtype)
-
-    if x.ndim == 5:
         return out4.reshape(B, T_frames, C, H_lo, W_lo).permute(0, 2, 1, 3, 4)
     return out4
 
@@ -461,17 +499,20 @@ def _plan_transitions(
     """Return ``(first, transitions)``: ``_resolve_transitions`` plus a start scale.
 
     ``first`` indexes ``scales`` at the scale sampling starts at. It is 0
-    unless a resolved threshold sits at or above 1.0, which only a
-    ``sigma_divisor`` below 1.0 produces (Eq. 10 thresholds are below 1 by
-    construction). Such a transition would land at step 0: the initial DCT
-    truncation would throw away the high band of the user's seed noise, no
-    coarse step would run, and the expansion would refill that band with
-    freshly seeded noise and patch sigma[0] to the aligned timestep -- no
-    compute saved, and an output that no longer matches a plain run. So it is
-    dropped instead, and the run starts at the next scale up. Thresholds fall
-    along the ladder, so the dropped ones are always a leading run; dropping
-    all of them leaves ``first == len(scales) - 1``, a plain full-resolution
-    run. It also keeps an out-of-range ``t*`` away from
+    unless a transition would land at step 0, which happens in two ways: a
+    resolved threshold sits at or above 1.0 (only a ``sigma_divisor`` below
+    1.0 produces that; Eq. 10 thresholds are below 1 by construction), or the
+    schedule itself starts at or below the threshold -- an img2img or hires
+    pass whose denoise leaves ``sigmas[0]`` under ``t*``. Such a transition
+    would run no coarse step: the initial DCT truncation would throw away the
+    high band of the latent (the user's seed noise, or the init image's fine
+    detail), and the expansion would refill that band with freshly seeded
+    noise and patch sigma[0] to the aligned timestep -- no compute saved, and
+    an output that no longer matches a plain run. So it is dropped instead,
+    and the run starts at the next scale up. Thresholds fall along the
+    ladder, so the dropped ones are always a leading run; dropping all of them
+    leaves ``first == len(scales) - 1``, a plain full-resolution run. Checking
+    ``t* >= 1`` first also keeps an out-of-range ``t*`` away from
     ``reference_coarse_fraction``, which only accepts ``(0, 1)``.
     """
     if len(scales) < 2:
@@ -549,34 +590,68 @@ def _plan_transitions(
                         "usual cause."
                     )
                 step_idx = limit
+        if step_idx == 0:
+            first = i + 1
+            _log_start_below(log_fn, sigmas, s_old, s_new, t_thr)
+            continue
         if step_idx >= n_steps:
             break
         out.append((step_idx, s_old, s_new))
     return first, out
 
 
+def _log_start_below(log_fn, sigmas, s_old: float, s_new: float, thr: float):
+    """Log a transition dropped because the schedule starts at or below it."""
+    if log_fn is not None:
+        log_fn(
+            f"schedule starts at sigma {float(sigmas[0]):.4f}, at or below the "
+            f"{s_old:g}->{s_new:g} transition's sigma {thr:.4f} (img2img or a "
+            f"hires pass at this denoise); dropping it and starting at scale "
+            f"{s_new:g} -- the coarse pass has no steps to run."
+        )
+
+
 def _resolve_manual(
     sigmas: torch.Tensor, scales: List[float], manual_sigmas: List[float],
 ) -> List[Tuple[int, float, float]]:
     """Return transitions from user-specified sigma thresholds."""
+    return _plan_manual(sigmas, scales, manual_sigmas)[1]
+
+
+def _plan_manual(
+    sigmas: torch.Tensor, scales: List[float], manual_sigmas: List[float],
+    log_fn: Callable[[str], None] = None,
+) -> Tuple[int, List[Tuple[int, float, float]]]:
+    """Return ``(first, transitions)`` from user-specified sigma thresholds.
+
+    ``first`` is as in ``_plan_transitions``: a threshold the schedule starts
+    at or below would transition at step 0, so it is dropped and the run
+    starts at the next scale. Manual sigmas are validated strictly
+    decreasing, so the dropped ones are a leading run here too.
+    """
     if len(scales) < 2:
-        return []
+        return 0, []
     if len(manual_sigmas) != len(scales) - 1:
         raise ValueError(
             f"manual_sigmas has length {len(manual_sigmas)}, expected "
             f"{len(scales) - 1} (one threshold per transition in scales)."
         )
+    first = 0
     out: List[Tuple[int, float, float]] = []
     n_steps = len(sigmas) - 1
-    for s_old, s_new, thr in zip(scales[:-1], scales[1:], manual_sigmas):
+    for i, (s_old, s_new, thr) in enumerate(zip(scales[:-1], scales[1:], manual_sigmas)):
         step_idx = next(
             (j for j in range(n_steps) if float(sigmas[j]) <= thr),
             n_steps,
         )
+        if step_idx == 0:
+            first = i + 1
+            _log_start_below(log_fn, sigmas, s_old, s_new, thr)
+            continue
         if step_idx >= n_steps:
             break
         out.append((step_idx, s_old, s_new))
-    return out
+    return first, out
 
 
 # =============================================================================
@@ -626,6 +701,7 @@ def sample_speed_core(
     full_res_sampler_kwargs: dict = None,
     log_fn: Callable[[str], None] = None,
     segment_hook: Callable = None,
+    init_image: Optional[torch.Tensor] = None,
 ):
     """Run ``sampler_fn`` segment-by-segment with spectral expansion in between.
 
@@ -656,6 +732,12 @@ def sample_speed_core(
     callback index inside the segment as run to an index inside the original
     segment (see ``_segment_callback``). The Forge Neo script uses this for
     per-segment CFG and step density; the ComfyUI node never passes it.
+
+    ``init_image`` (default ``None``) is the init image's contribution to
+    ``x`` for an img2img or hires pass, at full resolution and in the same
+    space as ``x`` -- what the backend's noise scaling adds to the noise, e.g.
+    ``(1 - sigma[0]) * init_latent`` for a flow model. ``None`` or zeros means
+    ``x`` is pure noise. See ``_initial_dct_downscale`` for why it matters.
     """
     extra_args = {} if extra_args is None else extra_args
     sampler_kwargs = dict(sampler_kwargs or {})
@@ -679,7 +761,8 @@ def sample_speed_core(
         # [1.0], which the loop below runs as one full-resolution segment.
         scales = scales[first:]
     elif mode == "manual":
-        transitions = _resolve_manual(sigmas, scales, manual_sigmas or [])
+        first, transitions = _plan_manual(sigmas, scales, manual_sigmas or [], log_fn=log_fn)
+        scales = scales[first:]
     else:
         raise ValueError(f"mode must be delta_optimal|manual, got {mode!r}")
     first_scale = scales[0]
@@ -707,7 +790,7 @@ def sample_speed_core(
 
     # DCT-truncate the incoming latent down to the coarsest scale.
     if first_scale < 1.0:
-        x = _initial_dct_downscale(x, first_scale)
+        x = _initial_dct_downscale(x, first_scale, init_image)
 
     sigmas = sigmas.clone()
     segment_starts = [0] + [t[0] for t in transitions]

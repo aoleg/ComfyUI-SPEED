@@ -29,6 +29,30 @@ def _log(msg: str):
     print(f"[SPEED] {msg}")
 
 
+def _init_image_part(model, x, sigmas):
+    """Return the init image's contribution to ``x``, or ``None`` for txt2img.
+
+    ComfyUI's ``KSAMPLER.sample`` hands the sampler function a
+    ``KSamplerX0Inpaint`` whose ``latent_image`` is the clean latent (already
+    through ``process_latent_in``, zeros for an empty latent) and whose
+    ``inner_model`` is the guider holding the ``BaseModel``. The model's
+    ``noise_scaling`` with zero noise gives exactly the image part of ``x`` in
+    the model's own convention (``(1 - sigma) * latent`` for flow models).
+    """
+    latent = getattr(model, "latent_image", None)
+    if not isinstance(latent, torch.Tensor) or tuple(latent.shape) != tuple(x.shape):
+        return None
+    if not torch.count_nonzero(latent):
+        return None
+    latent = latent.to(device=x.device, dtype=x.dtype)
+    try:
+        model_sampling = model.inner_model.inner_model.model_sampling
+        return model_sampling.noise_scaling(sigmas[0], torch.zeros_like(x), latent, False)
+    except Exception:
+        s0 = float(sigmas[0])
+        return latent * (1.0 - s0) if s0 <= 1.0 else latent
+
+
 @torch.no_grad()
 def sample_speed(
     model, x, sigmas, extra_args=None, callback=None, disable=None,
@@ -52,10 +76,20 @@ def sample_speed(
     if sampler_fn is None:
         raise ValueError(f"Unknown base sampler {base_sampler!r}.")
 
+    if extra_args is not None and extra_args.get("denoise_mask") is not None:
+        # A noise mask is blended against the full-resolution latent after
+        # every step; a coarse segment cannot honour it. Run the base sampler.
+        if log:
+            _log("noise mask present (masked / inpaint denoising); SPEED skipped for this pass.")
+        return sampler_fn(model, x, sigmas, extra_args=extra_args,
+                          callback=callback, disable=disable)
+
+    init_image = _init_image_part(model, x, sigmas)
     if log:
         _log(f"pass start: x={tuple(x.shape)}, steps={len(sigmas) - 1}, "
              f"sigmas {float(sigmas[0]):.4f}->{float(sigmas[-2]):.4f}, "
-             f"mode={mode}, transform={transform}, scales={scales}, seed={seed}")
+             f"mode={mode}, transform={transform}, scales={scales}, seed={seed}"
+             + (", img2img" if init_image is not None else ""))
 
     return sample_speed_core(
         sampler_fn, model, x, sigmas,
@@ -66,6 +100,7 @@ def sample_speed(
         adaptive_delta=adaptive_delta, ref_latent=ref_latent,
         ref_shift=ref_shift,
         log_fn=_log if log else None,
+        init_image=init_image,
     )
 
 

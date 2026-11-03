@@ -25,6 +25,11 @@ Workflow:
 1. Place this folder under your ComfyUI `custom_nodes` directory, then restart ComfyUI.
 2. Connect the **Sampler SPEED (Spectral Progressive Diffusion)** output to **SamplerCustomAdvanced**.
 
+Notes for the ComfyUI node:
+
+- **Image-to-image** works as with any sampler: a VAE-encoded latent with a `denoise` below 1 (BasicScheduler) seeds the first stage with the image low-passed to that stage's size, at its own level. A pass whose schedule already starts below a transition sigma has no coarse steps to run; that transition is dropped and the pass runs at the next scale up, with a console line saying so.
+- **Masked denoising** (a latent with a noise mask) is skipped: the mask is blended against the full-resolution latent after every step, which a coarse segment cannot honour. The base sampler runs instead.
+
 ## Usage (Forge Neo / sd-webui-forge-classic)
 
 The same repo doubles as a webui extension — the shared math lives in `speed_core.py`, the webui integration in `scripts/speed_forge.py`.
@@ -37,7 +42,8 @@ Notes for the webui version:
 
 - Designed for **flow-matching models** (Flux, Wan, Krea 2, Z-Image, …) whose sigmas are in `(0, 1]`. eps-prediction models (SD1.x/SDXL) run but are unvalidated and currently produce soft results — `docs/sdxl-analysis.md` explains why. In `manual` mode thresholds above 1.0 are accepted for such schedules.
 - **Inpainting** is automatically skipped (masks and inpaint image conditioning are tied to the full latent resolution).
-- The **hires-fix pass** is untouched unless "Apply to hires-fix pass" is checked.
+- **img2img** seeds the first stage with the init image low-passed to that stage's size, at its own level, plus the seed noise at coarse size. A pass whose schedule already starts below a transition sigma (a low denoising strength) has no coarse steps to run; that transition is dropped and the pass runs at the next scale up, with a console line saying so.
+- The **hires-fix pass** is untouched unless "Apply to hires-fix pass" is checked; when it is, the pass is an img2img pass and the two points above apply.
 - Brownian-noise samplers (DPM++ SDE family) work, but their pre-built noise sampler is only used on the full-resolution segment; coarse segments fall back to the sampler's default noise.
 - The `dwt` transform needs the optional `PyWavelets` package (`pip install PyWavelets` into the webui venv); `dct` (default) and `fft` have no extra dependencies.
 - If a transition threshold is never reached (too few steps / too small `delta`), the console warns and the output stays at the coarse resolution — increase steps or `delta`.

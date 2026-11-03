@@ -832,6 +832,32 @@ def _diversity_infotext(div: dict, run: dict) -> str:
             + (" experimental" if div.get("experimental") else ""))
 
 
+def _init_image_part(model, x, sigmas):
+    """Return the init image's contribution to ``x``, or ``None`` for txt2img.
+
+    Forge's ``sample_img2img`` builds ``x`` with the predictor's
+    ``noise_scaling(sigma[0], noise, init_latent)`` and keeps the init latent
+    on the CFG denoiser as ``init_latent`` (the ``model`` the sampler function
+    receives); its ``inner_model`` is the schedule linker holding the
+    predictor. The same call with zero noise gives the image part in the
+    model's own convention. A txt2img pass has no init latent.
+    """
+    init = getattr(model, "init_latent", None)
+    if not isinstance(init, torch.Tensor) or tuple(init.shape) != tuple(x.shape):
+        return None
+    if not torch.count_nonzero(init):
+        return None
+    init = init.to(device=x.device, dtype=x.dtype)
+    predictor = getattr(getattr(model, "inner_model", None), "predictor", None)
+    try:
+        if predictor is not None:
+            return predictor.noise_scaling(sigmas[0], torch.zeros_like(x), init, max_denoise=False)
+    except Exception:
+        pass
+    s0 = float(sigmas[0])
+    return init * (1.0 - s0) if s0 <= 1.0 else init
+
+
 def _make_speed_func(base_fn, cfg: dict):
     """Wrap a k-diffusion ``sample_*`` function with SPEED segmentation."""
 
@@ -856,10 +882,12 @@ def _make_speed_func(base_fn, cfg: dict):
         if noise_sampler is not None:
             full_res_kwargs["noise_sampler"] = noise_sampler
 
+        init_image = _init_image_part(model, x, sigmas)
         _log(f"pass start: x={tuple(x.shape)}, steps={len(sigmas) - 1}, "
              f"sigmas {float(sigmas[0]):.4f}->{float(sigmas[-2]):.4f}, "
              f"mode={cfg['mode_label']}, transform={cfg['transform']}, "
-             f"scales={cfg['scales']}, seed={cfg['seed']}")
+             f"scales={cfg['scales']}, seed={cfg['seed']}"
+             + (", img2img" if init_image is not None else ""))
 
         SpeedForgeScript.started_passes += 1
         div = cfg.get("diversity")
@@ -882,7 +910,7 @@ def _make_speed_func(base_fn, cfg: dict):
                 adaptive_delta=cfg["adaptive_delta"], ref_latent=cfg["ref_latent"],
                 ref_shift=cfg["ref_shift"], sigma_divisor=cfg["sigma_divisor"],
                 sampler_kwargs=kwargs, full_res_sampler_kwargs=full_res_kwargs,
-                log_fn=_log, segment_hook=hook,
+                log_fn=_log, segment_hook=hook, init_image=init_image,
             )
         finally:
             kds.torch = prev_torch
