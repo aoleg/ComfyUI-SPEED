@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 from typing import Callable, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from .spectral_utils import (
@@ -23,6 +24,7 @@ from .spectral_utils import (
     dct2,
     dct_expand,
     dct_truncate,
+    idct2,
     delta_optimal_transitions,
     equivalent_delta,
     fft_expand,
@@ -861,4 +863,189 @@ def sample_speed_core(
         # Patch only the transition sigma, matching the reference inference loop.
         sigmas[step_idx] = float(t_tilde)
 
+    return x
+
+
+# =============================================================================
+# x0 hand-over on a distilled sigma grid.
+#
+# ``sample_speed_core`` continues the ODE trajectory across a transition: it
+# enlarges the noisy latent ``x_t``, corrects its statistics (``kappa``) and
+# moves the transition sigma to an aligned value. A few-step distilled model
+# whose output heads are tied to fixed sigmas (MiniMax-H3-Image's six PDD heads
+# on ``pdd_sigmas``) cannot take a sigma between its grid points, and an
+# LCM-style sampler already rebuilds every step from the model's x0 estimate
+# plus fresh noise. So this path hands over the way such a sampler steps:
+#
+#   1. run the coarse stage up to a schedule point, ending its last step at
+#      sigma 0, so the sampler returns its own x0 estimate;
+#   2. enlarge that x0 with an ideal band-limited (DCT zero-pad) interpolation;
+#   3. re-noise it with fresh full-size noise at the boundary sigma, through
+#      the backend's own noise scaling;
+#   4. run the remaining schedule at the larger size.
+#
+# The boundary sigma is a point of the schedule, so with the grid schedule
+# (Simple at ``pdd_steps``) every stage starts and ends on the grid and each
+# step runs the head it was distilled for. No kappa and no sigma alignment.
+# =============================================================================
+
+def even_size(full: int, scale: float, multiple: int = 2) -> int:
+    """``full * scale`` rounded to the nearest multiple of ``multiple`` (at least one multiple)."""
+    return max(multiple, multiple * round(full * scale / multiple))
+
+
+def dct_resize(x: torch.Tensor, H_tgt: int, W_tgt: int) -> torch.Tensor:
+    """Resize the trailing two axes by DCT zero-pad or truncation, keeping the level.
+
+    Orthonormal DCT coefficients scale with ``sqrt(H * W)`` for smooth
+    content, so the result is multiplied by ``sqrt(target area / source
+    area)``: a constant stays the same constant. That is the right gain for an
+    image (an x0 estimate), not for white noise.
+    """
+    H, W = x.shape[-2], x.shape[-1]
+    if (H, W) == (H_tgt, W_tgt):
+        return x.float()
+    coeffs = dct2(x)
+    out = coeffs.new_zeros(tuple(coeffs.shape[:-2]) + (H_tgt, W_tgt))
+    h, w = min(H, H_tgt), min(W, W_tgt)
+    out[..., :h, :w] = coeffs[..., :h, :w]
+    return idct2(out) * math.sqrt((H_tgt * W_tgt) / (H * W))
+
+
+def handover_boundaries(n_steps: int, stage_steps: List[int]) -> List[int]:
+    """Step indices where each stage after the first starts.
+
+    ``stage_steps`` lists the steps of every stage but the last, which takes
+    the rest. ``[3]`` on 6 steps is the 3 + 3 split and gives ``[3]``.
+    """
+    if any(int(k) < 1 for k in stage_steps):
+        raise ValueError(f"every stage needs at least one step; got {stage_steps}")
+    out, at = [], 0
+    for k in stage_steps:
+        at += int(k)
+        out.append(at)
+    if out and at >= n_steps:
+        raise ValueError(
+            f"stage steps {stage_steps} use {at} of {n_steps} steps; the last stage "
+            "needs at least one step of its own"
+        )
+    return out
+
+
+def _flow_noise_scaling(sigma, noise, x0):
+    return sigma * noise + (1.0 - sigma) * x0
+
+
+def handover_noise(shape, seed: int, stage: int, device, dtype) -> torch.Tensor:
+    """Standard normal hand-over noise for ``stage`` from the CPU numpy generator,
+    so a seed gives the same noise on every device."""
+    rng = np.random.default_rng([int(seed) & 0xFFFFFFFF, int(stage)])
+    return torch.from_numpy(rng.standard_normal(tuple(shape)).astype(np.float32)).to(
+        device=device, dtype=dtype)
+
+
+@torch.no_grad()
+def sample_x0_handover_core(
+    sampler_fn: Callable, model, x, sigmas, extra_args=None, callback=None, disable=None,
+    *,
+    scales: List[float],
+    stage_steps: List[int],
+    seed: int = 0,
+    patch: int = 2,
+    noise_scaling: Callable = None,
+    handover_noise_mult: Callable[[int], float] = None,
+    sampler_kwargs: dict = None,
+    segment_kwargs: Callable[[int, int], dict] = None,
+    full_res_sampler_kwargs: dict = None,
+    log_fn: Callable[[str], None] = None,
+    init_image: Optional[torch.Tensor] = None,
+):
+    """Run ``sampler_fn`` stage by stage with an x0 hand-over between stages.
+
+    ``scales`` are the stage sizes as fractions of ``x``'s spatial size, rising
+    to 1.0; each coarse stage side is rounded to a multiple of ``patch``. The
+    first stage starts from a DCT low-pass of ``x`` (the run's own seed noise,
+    plus an img2img image at its own level).
+
+    ``stage_steps`` gives the steps of every stage but the last (see
+    ``handover_boundaries``). A coarse stage over steps ``a .. b-1`` runs
+    ``sigmas[a:b]`` followed by sigma 0, so its last step returns the
+    sampler's x0 estimate. A backend that picks a distilled head from the full
+    schedule (ComfyUI's MiniMax-H3-Image reads ``sample_sigmas``) still runs
+    the ``sigmas[b-1] -> sigmas[b]`` head on that step.
+
+    ``noise_scaling(sigma, noise, x0)`` builds the hand-over latent; the
+    default is the flow form ``sigma * noise + (1 - sigma) * x0``. Pass the
+    backend's own so a model-level noise scale applies. ``handover_noise_mult
+    (b)`` optionally scales the hand-over noise at boundary step ``b`` (an LCM
+    noise ramp). The noise comes from ``handover_noise(seed, stage)``.
+
+    ``segment_kwargs(start, n_steps)`` returns per-stage sampler options merged
+    over ``sampler_kwargs``, for a sampler option that spans the whole
+    schedule (a noise ramp). ``full_res_sampler_kwargs`` go to the last stage
+    only.
+    """
+    extra_args = {} if extra_args is None else extra_args
+    sampler_kwargs = dict(sampler_kwargs or {})
+    full_res_sampler_kwargs = dict(full_res_sampler_kwargs or {})
+    noise_scaling = noise_scaling or _flow_noise_scaling
+
+    validate_scales(scales)
+    n_steps = len(sigmas) - 1
+    if len(stage_steps) != len(scales) - 1:
+        raise ValueError(
+            f"stage_steps has {len(stage_steps)} entries, expected {len(scales) - 1} "
+            "(one per stage except the last)"
+        )
+    bounds = handover_boundaries(n_steps, stage_steps)
+    starts = [0] + bounds
+    ends = bounds + [n_steps]
+
+    H_full, W_full = x.shape[-2], x.shape[-1]
+    if (H_full % patch or W_full % patch) and log_fn is not None:
+        log_fn(f"warning: the latent {H_full}x{W_full} is not a multiple of the "
+               f"{patch}x{patch} patch; the model pads the last stage")
+    sizes = [(even_size(H_full, s, patch), even_size(W_full, s, patch)) for s in scales[:-1]]
+    sizes.append((H_full, W_full))
+
+    if log_fn is not None:
+        plan = "; ".join(
+            f"{h}x{w} for steps {a + 1}-{b} (sigma {float(sigmas[a]):.4f}->{float(sigmas[b]):.4f})"
+            for (h, w), a, b in zip(sizes, starts, ends)
+        )
+        log_fn(f"x0 hand-over: {plan}")
+
+    H0, W0 = sizes[0]
+    if (H0, W0) != (H_full, W_full):
+        x4 = _fold_frames(x).float()
+        if init_image is not None and torch.count_nonzero(init_image):
+            img4 = _fold_frames(init_image).to(device=x.device, dtype=torch.float32)
+            x4 = dct_truncate(x4 - img4, H0, W0) + dct_resize(img4, H0, W0)
+        else:
+            x4 = dct_truncate(x4, H0, W0)
+        x = _unfold_frames(x4, x)
+
+    for stage, (a, b) in enumerate(zip(starts, ends)):
+        last = stage == len(starts) - 1
+        seg = sigmas[a:] if last else torch.cat([sigmas[a:b], sigmas.new_zeros(1)])
+        kw = dict(sampler_kwargs)
+        if segment_kwargs is not None:
+            kw.update(segment_kwargs(a, b - a) or {})
+        if last:
+            kw.update(full_res_sampler_kwargs)
+        x = sampler_fn(model, x, seg, extra_args=extra_args,
+                       callback=_segment_callback(callback, a), disable=disable, **kw)
+        if last:
+            break
+
+        # x is this stage's x0 estimate at its own size.
+        H_n, W_n = sizes[stage + 1]
+        x0 = _unfold_frames(dct_resize(_fold_frames(x), H_n, W_n), x)
+        noise = handover_noise(x0.shape, seed, stage + 1, x0.device, x0.dtype)
+        if handover_noise_mult is not None:
+            noise = noise * float(handover_noise_mult(b))
+        x = noise_scaling(sigmas[b], noise, x0)
+        if log_fn is not None:
+            log_fn(f"hand-over at step {b}: x0 {sizes[stage][0]}x{sizes[stage][1]} -> "
+                   f"{H_n}x{W_n}, fresh noise at sigma {float(sigmas[b]):.4f}")
     return x

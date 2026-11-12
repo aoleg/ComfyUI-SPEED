@@ -23,6 +23,7 @@ from .speed_core import (
     _parse_scales,
     _parse_sigmas,
     sample_speed_core,
+    sample_x0_handover_core,
 )
 
 
@@ -324,6 +325,211 @@ class SamplerSPEED(io.ComfyNode):
             },
             # ddim is euler with ComfyUI's random inpaint noise; keep whatever
             # the base object asked for.
+            inpaint_options=dict(getattr(base, "inpaint_options", {}) or {}),
+        )
+        return io.NodeOutput(wrapped)
+
+
+# =============================================================================
+# x0 hand-over sampler (distilled few-step models on a fixed sigma grid)
+# =============================================================================
+
+# ComfyUI's simple scheduler reads sigmas from a 1000-entry table, so at 6
+# steps it lands within 0.001 of MiniMax-H3-Image's grid (0.5337 for 0.5328),
+# not on it; the head pick takes the nearest grid point either way.
+GRID_TOLERANCE = 2e-3
+
+
+def _parse_steps(s: str) -> List[int]:
+    """Parse the comma-separated steps of every stage but the last."""
+    out = [int(v.strip()) for v in str(s).split(",") if v.strip()]
+    if any(v < 1 for v in out):
+        raise ValueError(f"stage steps must be positive integers; got {out}")
+    return out
+
+
+def _model_internals(model):
+    """Return ``(model_sampling, pdd_grid, patch)`` from ComfyUI's sampler wrapper.
+
+    ``model`` is the ``KSamplerX0Inpaint`` a KSAMPLER function receives; its
+    ``inner_model`` is the guider and the guider's ``inner_model`` the
+    ``BaseModel``. Anything missing comes back as ``None`` (patch 2).
+    """
+    try:
+        base_model = model.inner_model.inner_model
+    except AttributeError:
+        return None, None, 2
+    ms = getattr(base_model, "model_sampling", None)
+    dm = getattr(base_model, "diffusion_model", None)
+    grid = getattr(dm, "pdd_sigmas", None)
+    patch = getattr(dm, "patch_size", None)
+    try:
+        patch = max(int(p) for p in tuple(patch)[-2:]) if patch is not None else 2
+    except (TypeError, ValueError):
+        patch = 2
+    return ms, (list(grid) if grid is not None else None), max(1, patch)
+
+
+def _on_grid(sigma: float, grid) -> bool:
+    return any(abs(float(sigma) - float(g)) <= GRID_TOLERANCE for g in grid)
+
+
+def _lcm_ramp(sampler_fn, kwargs: dict, n_steps: int):
+    """Return ``ramp(i)``, LCM's per-step noise multiplier over the whole run, or ``None``.
+
+    ComfyUI's ``sample_lcm`` interpolates ``s_noise`` -> ``s_noise_end``
+    across the steps of one call. A staged run makes one call per stage, so
+    each stage gets its slice of the full ramp instead of the whole ramp again.
+    """
+    if getattr(sampler_fn, "__name__", "") != "sample_lcm":
+        return None
+    s0 = float(kwargs.get("s_noise", 1.0))
+    s1 = kwargs.get("s_noise_end", None)
+    s1 = s0 if s1 is None else float(s1)
+    return lambda i: s0 + (s1 - s0) * (i / (n_steps - 1) if n_steps > 1 else 0.0)
+
+
+@torch.no_grad()
+def sample_speed_handover(
+    model, x, sigmas, extra_args=None, callback=None, disable=None,
+    *,
+    base=None,
+    base_label: str = "lcm",
+    scales: List[float] = None,
+    stage_steps: List[int] = None,
+    seed: int = 0,
+    log: bool = True,
+):
+    """Comfy ``sample_*`` function: staged sampling with an x0 hand-over."""
+    if base is None:
+        base, base_label = _resolve_base(base_label)
+    extra_args = {} if extra_args is None else extra_args
+    sampler_fn = base.sampler_function
+    sampler_kwargs = dict(getattr(base, "extra_options", {}) or {})
+    log_fn = _log if log else None
+
+    if extra_args.get("denoise_mask") is not None:
+        if log:
+            _log("noise mask present (masked / inpaint denoising); SPEED skipped for this pass.")
+        return sampler_fn(model, x, sigmas, extra_args=extra_args,
+                          callback=callback, disable=disable, **sampler_kwargs)
+
+    scales = list(scales or [0.5, 1.0])
+    stage_steps = list(stage_steps or [])
+    n_steps = len(sigmas) - 1
+    ms, grid, patch = _model_internals(model)
+    run_seed = int(extra_args.get("seed", 0) or 0) + int(seed)
+
+    if log:
+        _log(f"pass start: x={tuple(x.shape)}, steps={n_steps}, sampler={base_label}, "
+             f"x0 hand-over, scales={scales}, stage steps={stage_steps}, seed={run_seed}")
+    if grid is not None:
+        off = [round(float(s), 4) for s in sigmas[:-1] if not _on_grid(s, grid)]
+        if off and log:
+            _log(f"warning: the model's heads are distilled on sigmas {grid}; this schedule "
+                 f"has {off} off that grid. Use the simple scheduler at {len(grid) - 1} steps.")
+
+    init_image = _init_image_part(model, x, sigmas)
+
+    ramp = _lcm_ramp(sampler_fn, sampler_kwargs, n_steps)
+    segment_kwargs = None
+    handover_noise_mult = None
+    if ramp is not None:
+        def segment_kwargs(a, n):
+            return {"s_noise": ramp(a), "s_noise_end": ramp(a + n - 1)}
+
+        def handover_noise_mult(b):
+            return ramp(b - 1)
+
+    noise_scaling = None
+    if ms is not None and hasattr(ms, "noise_scaling"):
+        def noise_scaling(sigma, noise, x0):
+            return ms.noise_scaling(sigma.reshape(1).to(x0.device), noise, x0)
+
+    return sample_x0_handover_core(
+        sampler_fn, model, x, sigmas,
+        extra_args=extra_args, callback=callback, disable=disable,
+        scales=scales, stage_steps=stage_steps, seed=run_seed, patch=patch,
+        noise_scaling=noise_scaling, handover_noise_mult=handover_noise_mult,
+        sampler_kwargs=sampler_kwargs, segment_kwargs=segment_kwargs,
+        log_fn=log_fn, init_image=init_image,
+    )
+
+
+class SamplerSPEEDHandover(io.ComfyNode):
+    """Staged sampler with an x0 hand-over, for few-step distilled models."""
+
+    @classmethod
+    def define_schema(cls):
+        names = _list_samplers()
+        return io.Schema(
+            node_id="SamplerSPEEDHandover",
+            display_name="Sampler SPEED x0 hand-over (distilled models)",
+            category="sampling/custom_sampling/samplers",
+            description=(
+                "Runs the first steps at a smaller size, then hands the model's x0 estimate "
+                "to a larger size: enlarged with a DCT zero-pad and re-noised with fresh "
+                "noise at the next sigma of the schedule. Every stage starts and ends on a "
+                "schedule point, so a model with heads tied to a sigma grid (MiniMax-H3-Image "
+                "with the simple scheduler at 6 steps) runs each head on its own grid point."
+            ),
+            inputs=[
+                io.Combo.Input(
+                    "base_sampler", options=names, default="lcm" if "lcm" in names else names[0],
+                    tooltip="Solver for every stage. LCM suits distilled models: each step is "
+                            "already x0 plus fresh noise, so the hand-over is one more such "
+                            "step. Ignored when a SAMPLER is connected to `sampler` (connect "
+                            "SamplerLCM for a noise ramp; the ramp spans the whole run).",
+                ),
+                io.String.Input(
+                    "scales", default="0.5,1.0",
+                    tooltip="Stage sizes as fractions of the latent, ending at 1.0. Each side "
+                            "is rounded to the model's patch multiple. Make the latent the "
+                            "final size: 0.5,1.0 on a 4096x4096 latent composes at 2048x2048.",
+                ),
+                io.String.Input(
+                    "stage_steps", default="3",
+                    tooltip="Steps of every stage but the last, comma-separated; the last "
+                            "stage takes the rest. On a 6-step schedule: 3 is 3+3 (hand-over "
+                            "at sigma 0.75), 2 is 2+4, 4 is 4+2.",
+                ),
+                io.Int.Input(
+                    "seed", default=0, min=0, max=2**31 - 1, step=1,
+                    tooltip="Added to the sampling seed for the hand-over noise. The same "
+                            "sampling seed and this value give the same picture.",
+                ),
+                io.Boolean.Input(
+                    "log", default=True,
+                    tooltip="Print the stage sizes, sigmas and hand-overs to the console.",
+                ),
+                io.Sampler.Input(
+                    "sampler", optional=True,
+                    tooltip="Optional base solver as a SAMPLER object; replaces `base_sampler`.",
+                ),
+            ],
+            outputs=[io.Sampler.Output()],
+        )
+
+    @classmethod
+    def execute(cls, base_sampler, scales, stage_steps, seed, log, sampler=None):
+        parsed_scales = _parse_scales(scales)
+        parsed_steps = _parse_steps(stage_steps)
+        if len(parsed_steps) != len(parsed_scales) - 1:
+            raise ValueError(
+                f"stage_steps {parsed_steps} needs {len(parsed_scales) - 1} entries for "
+                f"scales {parsed_scales} (one per stage except the last)"
+            )
+        base, base_label = _resolve_base(base_sampler, sampler)
+        wrapped = comfy.samplers.KSAMPLER(
+            sample_speed_handover,
+            extra_options={
+                "base": base,
+                "base_label": base_label,
+                "scales": parsed_scales,
+                "stage_steps": parsed_steps,
+                "seed": int(seed),
+                "log": bool(log),
+            },
             inpaint_options=dict(getattr(base, "inpaint_options", {}) or {}),
         )
         return io.NodeOutput(wrapped)

@@ -32,6 +32,19 @@ Notes for the ComfyUI node:
 - **Image-to-image** works as with any sampler: a VAE-encoded latent with a `denoise` below 1 (BasicScheduler) seeds the first stage with the image low-passed to that stage's size, at its own level. A pass whose schedule already starts below a transition sigma has no coarse steps to run; that transition is dropped and the pass runs at the next scale up, with a console line saying so.
 - **Masked denoising** (a latent with a noise mask) is skipped: the mask is blended against the full-resolution latent after every step, which a coarse segment cannot honour. The base sampler runs instead.
 
+### x0 hand-over node (few-step distilled models)
+
+**Sampler SPEED x0 hand-over (distilled models)** is a second node for models distilled to a few fixed sigmas, such as MiniMax-H3-Image, whose six output heads are each tied to one interval of a fixed sigma grid. The SPEED node above moves the transition sigma to an aligned value, which falls between grid points. This node keeps every stage boundary on a schedule point instead.
+
+1. The first stage runs at a smaller size, and its last step goes to sigma 0, so the sampler returns its x0 estimate.
+2. The x0 estimate is enlarged with a DCT zero-pad, which is band-limited interpolation.
+3. Fresh full-size noise is added at the next sigma of the schedule. The noise comes from the sampling seed plus the node's `seed`, so the same seeds give the same picture.
+4. The remaining steps run at the full size.
+
+Make the latent the final size and set `scales` to `0.5,1.0`. A 4096x4096 latent then composes at 2048x2048. `stage_steps` holds the steps of every stage except the last. On a six-step schedule, `3` gives 3+3, `2` gives 2+4 and `4` gives 4+2. Each stage side is rounded to the model's patch multiple.
+
+For MiniMax-H3-Image, use the `simple` scheduler at 6 steps, which lands on the model's grid, and `lcm` as the base sampler. To use a noise ramp, connect a **SamplerLCM** node to `sampler`: the ramp then spans the whole run and does not restart at each stage. The console prints a warning when the schedule leaves the model's grid. To get a smaller picture, shrink the decoded image with **ImageScaleBy** using the `area` method.
+
 ## Usage (Forge Neo / sd-webui-forge-classic)
 
 The same repo doubles as a webui extension — the shared math lives in `speed_core.py`, the webui integration in `scripts/speed_forge.py`.
