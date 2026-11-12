@@ -22,8 +22,11 @@ step density of a RAW reference schedule; fine segments get Forge's own
 """
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import functools
 import importlib.util
+import math
 import os
 import sys
 import time
@@ -127,8 +130,119 @@ class _ShapeSafeRandn:
             noise = None
         if isinstance(noise, torch.Tensor) and noise.shape == x.shape:
             return noise
+        if isinstance(noise, torch.Tensor) and noise.numel() == x.numel():
+            # a packed still latent unpacked for SPEED (_PackedStill): the same noise, laid out spatially
+            return noise.reshape(x.shape)
         return torch.randn(x.shape, generator=self._generator,
                            dtype=torch.float32).to(device=x.device, dtype=x.dtype)
+
+
+# =============================================================================
+# Packed still-image latents (the MiniMax H3 port for Forge Neo)
+#
+# The port hands Forge's sampler a flat latent [B, 1, 1, N]: the picture
+# [1, C, 1, H, W] flattened, followed by an audio stub on profiles that have
+# one. Its engine (``p.sd_model``) and its transformer share one
+# ``generation``, whose ``shapes`` say how to unpack the latent, and the
+# transformer unpacks every call with those shapes. SPEED needs the spatial
+# axes, so the pass runs on the unpacked picture [B, C, H, W]; every model
+# call is packed again, with ``shapes`` set to that call's size while it runs.
+# =============================================================================
+
+def _packed_still(sd_model, x):
+    """The ``generation`` of a model whose latent ``x`` is a packed still image, else ``None``."""
+    generation = getattr(sd_model, "generation", None)
+    shapes = getattr(generation, "shapes", None)
+    if getattr(shapes, "video", None) is None or not isinstance(x, torch.Tensor):
+        return None
+    if x.ndim != 4 or x.shape[1] != 1 or x.shape[2] != 1 or x.shape[-1] != getattr(shapes, "size", None):
+        return None
+    return generation
+
+
+def _packed_still_blocker(generation):
+    """Why SPEED cannot segment this packed latent, or ``None`` when it can."""
+    shapes = generation.shapes
+    video = tuple(shapes.video)
+    if len(video) != 5 or video[2] != 1:
+        return f"the packed latent holds {video}, not one still picture"
+    if math.prod(tuple(shapes.audio)[1:]) != 0:
+        return "the packed latent carries an audio stub (MiniMax H3 profiles other than MiniMax-H3-Image)"
+    if getattr(generation, "refs", None):
+        return "the run has reference pictures, which are tied to the full-size picture"
+    if not dataclasses.is_dataclass(shapes):
+        return "the latent's shapes cannot be resized"
+    return None
+
+
+class _PackedStill:
+    """Unpacks a packed still latent for SPEED and packs every model call again."""
+
+    def __init__(self, generation):
+        self.generation = generation
+        self.full = generation.shapes
+        _, self.channels, _, self.height, self.width = self.full.video
+
+    def unpack(self, packed):
+        """[B, 1, 1, N] -> [B, C, H, W]."""
+        return packed.reshape(packed.shape[0], self.channels, self.height, self.width)
+
+    @staticmethod
+    def pack(x):
+        """[B, C, h, w] -> [B, 1, 1, C*h*w]."""
+        return x.reshape(x.shape[0], 1, 1, -1)
+
+    @contextlib.contextmanager
+    def sized(self, height, width):
+        """Point the generation's shapes at an (h, w) picture while a coarse call runs."""
+        if (height, width) == (self.height, self.width):
+            yield
+            return
+        self.generation.shapes = dataclasses.replace(self.full, video=(1, self.channels, 1, height, width))
+        try:
+            yield
+        finally:
+            self.generation.shapes = self.full
+
+    def model(self, inner):
+        return _PackedStillModel(inner, self)
+
+    def callback(self, callback):
+        """Full-size latents reach Forge's callback packed, as in a plain run; coarse ones stay [B, C, h, w],
+        which the RGB live preview reads directly."""
+        if callback is None:
+            return None
+
+        def packed_callback(d):
+            d = dict(d)
+            for key in ("x", "denoised"):
+                v = d.get(key)
+                if isinstance(v, torch.Tensor) and v.ndim == 4 and tuple(v.shape[-2:]) == (self.height, self.width):
+                    d[key] = self.pack(v)
+            return callback(d)
+        return packed_callback
+
+    def noise_sampler(self, inner):
+        return lambda *args, **kwargs: self.unpack(inner(*args, **kwargs))
+
+
+class _PackedStillModel:
+    """The CFG denoiser seen through ``_PackedStill``: takes and returns [B, C, h, w]."""
+
+    def __init__(self, inner, still):
+        object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "_still", still)
+
+    def __call__(self, x, sigma, **kwargs):
+        with self._still.sized(x.shape[-2], x.shape[-1]):
+            out = self._inner(self._still.pack(x), sigma, **kwargs)
+        return out.reshape(x.shape)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._inner, name, value)
 
 
 def _anima_reference_latents_active(p) -> bool:
@@ -875,14 +989,32 @@ def _make_speed_func(base_fn, cfg: dict):
                  "alignment assumes flow-matching sigmas in (0, 1] (Flux/Wan). "
                  "Results on eps-prediction models are unvalidated.")
 
+        generation = _packed_still(cfg.get("sd_model"), x)
+        still = None
+        if generation is not None:
+            blocker = _packed_still_blocker(generation)
+            if blocker is not None:
+                _log(f"packed latent {tuple(x.shape)}: {blocker}; SPEED skipped for this pass.")
+                return base_fn(model, x, sigmas, extra_args=extra_args,
+                               callback=callback, disable=disable, **kwargs)
+            still = _PackedStill(generation)
+
         # Objects tied to the full-resolution latent shape must not reach
         # coarse segments (Brownian noise sampler pre-built from full-res x).
         full_res_kwargs = {}
         noise_sampler = kwargs.pop("noise_sampler", None)
         if noise_sampler is not None:
-            full_res_kwargs["noise_sampler"] = noise_sampler
+            full_res_kwargs["noise_sampler"] = (noise_sampler if still is None
+                                                else still.noise_sampler(noise_sampler))
 
         init_image = _init_image_part(model, x, sigmas)
+        packed_shape = None
+        if still is not None:
+            packed_shape = tuple(x.shape)
+            x = still.unpack(x)
+            if init_image is not None:
+                init_image = still.unpack(init_image)
+            _log(f"packed latent {packed_shape} unpacked to {tuple(x.shape)}")
         _log(f"pass start: x={tuple(x.shape)}, steps={len(sigmas) - 1}, "
              f"sigmas {float(sigmas[0]):.4f}->{float(sigmas[-2]):.4f}, "
              f"mode={cfg['mode_label']}, transform={cfg['transform']}, "
@@ -896,13 +1028,17 @@ def _make_speed_func(base_fn, cfg: dict):
         if div is not None:
             hook = _make_diversity_hook(div, model, float(sigmas[-1]), run)
 
+        run_model, run_callback = model, callback
+        if still is not None:
+            run_model, run_callback = still.model(model), still.callback(callback)
+
         import k_diffusion.sampling as kds
         prev_torch = kds.torch
         kds.torch = _ShapeSafeRandn(prev_torch, cfg["seed"])
         try:
             result = speed_core.sample_speed_core(
-                base_fn, model, x, sigmas,
-                extra_args=extra_args, callback=callback, disable=disable,
+                base_fn, run_model, x, sigmas,
+                extra_args=extra_args, callback=run_callback, disable=disable,
                 transform=cfg["transform"], mode=cfg["mode"],
                 scales=cfg["scales"], delta=cfg["delta"],
                 spectrum_A=cfg["spectrum_A"], spectrum_beta=cfg["spectrum_beta"],
@@ -927,6 +1063,14 @@ def _make_speed_func(base_fn, cfg: dict):
                 _log("diversity: no coarse segment ran in this pass (it starts below "
                      "the transition sigma, or the sigma divisor dropped the "
                      "transition); RAW stage not applied")
+
+        if still is not None:
+            if tuple(result.shape[-2:]) != (still.height, still.width):
+                raise RuntimeError(
+                    f"SPEED: the pass ended at {tuple(result.shape[-2:])}, not the picture's "
+                    f"{(still.height, still.width)}, and a packed latent cannot hold a smaller picture. "
+                    "Increase steps or move the transition earlier.")
+            result = still.pack(result)
 
         SpeedForgeScript.completed_passes += 1
         return result
@@ -1432,6 +1576,8 @@ class SpeedForgeScript(scripts.Script):
             return
 
         pass_cfg = dict(cls.config)
+        # the engine, read at sampling time for a packed latent's generation (_packed_still)
+        pass_cfg["sd_model"] = getattr(p, "sd_model", None)
         if cls.diversity is not None and not getattr(p, "is_hr_pass", False):
             pass_cfg["diversity"] = self._diversity_runtime(p, cls.diversity, kwargs.get("uc"))
 
