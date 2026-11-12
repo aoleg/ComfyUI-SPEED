@@ -879,8 +879,9 @@ def sample_speed_core(
 #
 #   1. run the coarse stage up to a schedule point, ending its last step at
 #      sigma 0, so the sampler returns its own x0 estimate;
-#   2. enlarge that x0 (``upscale_x0``: bilinear by default, since a DCT
-#      zero-pad rings and the next stage keeps the rings);
+#   2. enlarge that x0 in latent space (``upscale_x0``, bilinear by default);
+#      interpolated codes of a high-compression VAE decode to doubled edges,
+#      which the next stage repairs only when the hand-over noise is high;
 #   3. re-noise it with fresh full-size noise at the boundary sigma, through
 #      the backend's own noise scaling;
 #   4. run the remaining schedule at the larger size.
