@@ -879,7 +879,8 @@ def sample_speed_core(
 #
 #   1. run the coarse stage up to a schedule point, ending its last step at
 #      sigma 0, so the sampler returns its own x0 estimate;
-#   2. enlarge that x0 with an ideal band-limited (DCT zero-pad) interpolation;
+#   2. enlarge that x0 (``upscale_x0``: bilinear by default, since a DCT
+#      zero-pad rings and the next stage keeps the rings);
 #   3. re-noise it with fresh full-size noise at the boundary sigma, through
 #      the backend's own noise scaling;
 #   4. run the remaining schedule at the larger size.
@@ -910,6 +911,39 @@ def dct_resize(x: torch.Tensor, H_tgt: int, W_tgt: int) -> torch.Tensor:
     h, w = min(H, H_tgt), min(W, W_tgt)
     out[..., :h, :w] = coeffs[..., :h, :w]
     return idct2(out) * math.sqrt((H_tgt * W_tgt) / (H * W))
+
+
+UPSCALE_METHODS = ("bilinear", "bicubic", "dct")
+
+
+def upscale_x0(x: torch.Tensor, H_tgt: int, W_tgt: int, method: str = "bilinear") -> torch.Tensor:
+    """Enlarge an x0 estimate over its trailing two axes.
+
+    - ``bilinear`` (default): never overshoots and has no ripple tail.
+    - ``bicubic``: one lobe of overshoot (about 11% of a step) next to an
+      edge, nothing beyond two pixels; slightly sharper.
+    - ``dct``: DCT zero-pad, the ideal band-limited interpolation. Its sinc
+      kernel rings (Gibbs) with a slowly decaying tail of echoes at the source
+      grid's pixel pitch, and a 16x VAE latent holds much of its energy near
+      that grid's Nyquist frequency. The echoes sit in the band the next stage
+      treats as decided, so they survive as halos and ghost contours, worse the
+      later the hand-over (measured on MiniMax-H3-Image: halos at 3+3, ghost
+      contours at 4+2). A soft DCT band edge does not cure it without blurring
+      more than bilinear.
+
+    Spatial methods use ``align_corners=False``, so the grids stay centred.
+    """
+    if method not in UPSCALE_METHODS:
+        raise ValueError(f"upscale must be one of {UPSCALE_METHODS}, got {method!r}")
+    H, W = x.shape[-2], x.shape[-1]
+    if (H, W) == (H_tgt, W_tgt):
+        return x.float()
+    if method == "dct":
+        return dct_resize(x, H_tgt, W_tgt)
+    lead = tuple(x.shape[:-2])
+    x4 = x.float().reshape((-1, 1, H, W))
+    out = torch.nn.functional.interpolate(x4, size=(H_tgt, W_tgt), mode=method, align_corners=False)
+    return out.reshape(lead + (H_tgt, W_tgt))
 
 
 def handover_boundaries(n_steps: int, stage_steps: List[int]) -> List[int]:
@@ -952,6 +986,7 @@ def sample_x0_handover_core(
     stage_steps: List[int],
     seed: int = 0,
     patch: int = 2,
+    upscale: str = "bilinear",
     noise_scaling: Callable = None,
     handover_noise_mult: Callable[[int], float] = None,
     sampler_kwargs: dict = None,
@@ -1002,6 +1037,8 @@ def sample_x0_handover_core(
     ends = bounds + [n_steps]
 
     H_full, W_full = x.shape[-2], x.shape[-1]
+    if upscale not in UPSCALE_METHODS:
+        raise ValueError(f"upscale must be one of {UPSCALE_METHODS}, got {upscale!r}")
     if (H_full % patch or W_full % patch) and log_fn is not None:
         log_fn(f"warning: the latent {H_full}x{W_full} is not a multiple of the "
                f"{patch}x{patch} patch; the model pads the last stage")
@@ -1040,12 +1077,12 @@ def sample_x0_handover_core(
 
         # x is this stage's x0 estimate at its own size.
         H_n, W_n = sizes[stage + 1]
-        x0 = _unfold_frames(dct_resize(_fold_frames(x), H_n, W_n), x)
+        x0 = _unfold_frames(upscale_x0(_fold_frames(x), H_n, W_n, upscale), x)
         noise = handover_noise(x0.shape, seed, stage + 1, x0.device, x0.dtype)
         if handover_noise_mult is not None:
             noise = noise * float(handover_noise_mult(b))
         x = noise_scaling(sigmas[b], noise, x0)
         if log_fn is not None:
             log_fn(f"hand-over at step {b}: x0 {sizes[stage][0]}x{sizes[stage][1]} -> "
-                   f"{H_n}x{W_n}, fresh noise at sigma {float(sigmas[b]):.4f}")
+                   f"{H_n}x{W_n} ({upscale}), fresh noise at sigma {float(sigmas[b]):.4f}")
     return x
