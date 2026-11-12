@@ -37,11 +37,13 @@ Notes for the ComfyUI node:
 **Sampler SPEED x0 hand-over (distilled models)** is a second node for models distilled to a few fixed sigmas, such as MiniMax-H3-Image, whose six output heads are each tied to one interval of a fixed sigma grid. The SPEED node above moves the transition sigma to an aligned value, which falls between grid points. This node keeps every stage boundary on a schedule point instead.
 
 1. The first stage runs at a smaller size, and its last step goes to sigma 0, so the sampler returns its x0 estimate.
-2. The x0 estimate is enlarged with the `upscale` method, `bilinear` by default. The `dct` method (a DCT zero-pad) is the ideal band-limited interpolation, but it rings at sharp edges. The next stage keeps the rings, which show as halos and repeated ghost contours, and they get worse the later the hand-over. `bicubic` is slightly sharper than `bilinear`, with a little overshoot right at edges.
+2. The x0 estimate is enlarged in latent space with the `upscale` method: `bilinear` (the default), `bicubic` or `dct` (a DCT zero-pad). On MiniMax-H3-Image the three methods give nearly the same picture.
 3. Fresh full-size noise is added at the next sigma of the schedule. The noise comes from the sampling seed plus the node's `seed`, so the same seeds give the same picture.
 4. The remaining steps run at the full size.
 
-Make the latent the final size and set `scales` to `0.5,1.0`. A 4096x4096 latent then composes at 2048x2048. `stage_steps` holds the steps of every stage except the last. On a six-step schedule, `3` gives 3+3, `2` gives 2+4 and `4` gives 4+2. Each stage side is rounded to the model's patch multiple.
+Make the latent the final size and set `scales` to `0.5,1.0`. A 4096x4096 latent then composes at 2048x2048. `stage_steps` holds the steps of every stage except the last. On a six-step schedule, `2` (the default) gives 2+4, `3` gives 3+3 and `4` gives 4+2. Each stage side is rounded to the model's patch multiple.
+
+Hand over early. An enlarged latent is not a latent the VAE or the model has seen: each code of a 16x VAE holds the detail inside its 16x16 patch, so interpolated codes decode to doubled edges and streaks. The full-size stage repairs this only when the hand-over noise is high. On MiniMax-H3-Image at 4096x4096, 2+4 (fresh noise at sigma 0.89) matches the stock 16 MP picture and takes about 60% of its time. 3+3 (sigma 0.75) keeps a halo around the subject, and 4+2 (sigma 0.53) shows streaks and repeated contours.
 
 For MiniMax-H3-Image, use the `simple` scheduler at 6 steps, which lands on the model's grid, and `lcm` as the base sampler. To use a noise ramp, connect a **SamplerLCM** node to `sampler`: the ramp then spans the whole run and does not restart at each stage. The console prints a warning when the schedule leaves the model's grid. To get a smaller picture, shrink the decoded image with **ImageScaleBy** using the `area` method.
 

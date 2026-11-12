@@ -491,17 +491,18 @@ class SamplerSPEEDHandover(io.ComfyNode):
                             "final size: 0.5,1.0 on a 4096x4096 latent composes at 2048x2048.",
                 ),
                 io.String.Input(
-                    "stage_steps", default="3",
+                    "stage_steps", default="2",
                     tooltip="Steps of every stage but the last, comma-separated; the last "
-                            "stage takes the rest. On a 6-step schedule: 3 is 3+3 (hand-over "
-                            "at sigma 0.75), 2 is 2+4, 4 is 4+2.",
+                            "stage takes the rest. On a 6-step schedule: 2 is 2+4 (hand-over "
+                            "at sigma 0.89), 3 is 3+3, 4 is 4+2. An enlarged latent needs high "
+                            "hand-over noise to heal: on MiniMax-H3-Image 3+3 leaves a halo "
+                            "and 4+2 streaks.",
                 ),
                 io.Combo.Input(
                     "upscale", options=list(UPSCALE_METHODS), default="bilinear",
-                    tooltip="How the x0 estimate is enlarged. bilinear: no overshoot, no "
-                            "ringing. bicubic: slightly sharper, a little overshoot right at "
-                            "edges. dct: ideal band-limited zero-pad, but its ringing survives "
-                            "as halos and ghost contours, worse the later the hand-over.",
+                    tooltip="How the x0 estimate is enlarged in latent space: bilinear, "
+                            "bicubic or a DCT zero-pad. On MiniMax-H3-Image they give nearly "
+                            "the same picture.",
                 ),
                 io.Int.Input(
                     "seed", default=0, min=0, max=2**31 - 1, step=1,
