@@ -37,7 +37,7 @@ Notes for the ComfyUI node:
 **Sampler SPEED x0 hand-over (distilled models)** is a second node for models distilled to a few fixed sigmas, such as MiniMax-H3-Image, whose six output heads are each tied to one interval of a fixed sigma grid. The SPEED node above moves the transition sigma to an aligned value, which falls between grid points. This node keeps every stage boundary on a schedule point instead.
 
 1. The first stage runs at a smaller size, and its last step goes to sigma 0, so the sampler returns its x0 estimate.
-2. The x0 estimate is enlarged with a DCT zero-pad, which is band-limited interpolation.
+2. The x0 estimate is enlarged with the `upscale` method, `bilinear` by default. The `dct` method (a DCT zero-pad) is the ideal band-limited interpolation, but it rings at sharp edges. The next stage keeps the rings, which show as halos and repeated ghost contours, and they get worse the later the hand-over. `bicubic` is slightly sharper than `bilinear`, with a little overshoot right at edges.
 3. Fresh full-size noise is added at the next sigma of the schedule. The noise comes from the sampling seed plus the node's `seed`, so the same seeds give the same picture.
 4. The remaining steps run at the full size.
 

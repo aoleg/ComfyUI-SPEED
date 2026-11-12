@@ -22,6 +22,7 @@ from .speed_core import (
     REFERENCE_LATENT,
     _parse_scales,
     _parse_sigmas,
+    UPSCALE_METHODS,
     sample_speed_core,
     sample_x0_handover_core,
 )
@@ -398,6 +399,7 @@ def sample_speed_handover(
     scales: List[float] = None,
     stage_steps: List[int] = None,
     seed: int = 0,
+    upscale: str = "bilinear",
     log: bool = True,
 ):
     """Comfy ``sample_*`` function: staged sampling with an x0 hand-over."""
@@ -422,7 +424,8 @@ def sample_speed_handover(
 
     if log:
         _log(f"pass start: x={tuple(x.shape)}, steps={n_steps}, sampler={base_label}, "
-             f"x0 hand-over, scales={scales}, stage steps={stage_steps}, seed={run_seed}")
+             f"x0 hand-over, scales={scales}, stage steps={stage_steps}, upscale={upscale}, "
+             f"seed={run_seed}")
     if grid is not None:
         off = [round(float(s), 4) for s in sigmas[:-1] if not _on_grid(s, grid)]
         if off and log:
@@ -449,7 +452,7 @@ def sample_speed_handover(
     return sample_x0_handover_core(
         sampler_fn, model, x, sigmas,
         extra_args=extra_args, callback=callback, disable=disable,
-        scales=scales, stage_steps=stage_steps, seed=run_seed, patch=patch,
+        scales=scales, stage_steps=stage_steps, seed=run_seed, patch=patch, upscale=upscale,
         noise_scaling=noise_scaling, handover_noise_mult=handover_noise_mult,
         sampler_kwargs=sampler_kwargs, segment_kwargs=segment_kwargs,
         log_fn=log_fn, init_image=init_image,
@@ -468,7 +471,7 @@ class SamplerSPEEDHandover(io.ComfyNode):
             category="sampling/custom_sampling/samplers",
             description=(
                 "Runs the first steps at a smaller size, then hands the model's x0 estimate "
-                "to a larger size: enlarged with a DCT zero-pad and re-noised with fresh "
+                "to a larger size: enlarged (bilinear by default) and re-noised with fresh "
                 "noise at the next sigma of the schedule. Every stage starts and ends on a "
                 "schedule point, so a model with heads tied to a sigma grid (MiniMax-H3-Image "
                 "with the simple scheduler at 6 steps) runs each head on its own grid point."
@@ -493,6 +496,13 @@ class SamplerSPEEDHandover(io.ComfyNode):
                             "stage takes the rest. On a 6-step schedule: 3 is 3+3 (hand-over "
                             "at sigma 0.75), 2 is 2+4, 4 is 4+2.",
                 ),
+                io.Combo.Input(
+                    "upscale", options=list(UPSCALE_METHODS), default="bilinear",
+                    tooltip="How the x0 estimate is enlarged. bilinear: no overshoot, no "
+                            "ringing. bicubic: slightly sharper, a little overshoot right at "
+                            "edges. dct: ideal band-limited zero-pad, but its ringing survives "
+                            "as halos and ghost contours, worse the later the hand-over.",
+                ),
                 io.Int.Input(
                     "seed", default=0, min=0, max=2**31 - 1, step=1,
                     tooltip="Added to the sampling seed for the hand-over noise. The same "
@@ -511,7 +521,7 @@ class SamplerSPEEDHandover(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, base_sampler, scales, stage_steps, seed, log, sampler=None):
+    def execute(cls, base_sampler, scales, stage_steps, seed, log, sampler=None, upscale="bilinear"):
         parsed_scales = _parse_scales(scales)
         parsed_steps = _parse_steps(stage_steps)
         if len(parsed_steps) != len(parsed_scales) - 1:
@@ -528,6 +538,7 @@ class SamplerSPEEDHandover(io.ComfyNode):
                 "scales": parsed_scales,
                 "stage_steps": parsed_steps,
                 "seed": int(seed),
+                "upscale": str(upscale),
                 "log": bool(log),
             },
             inpaint_options=dict(getattr(base, "inpaint_options", {}) or {}),
